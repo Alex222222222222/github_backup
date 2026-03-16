@@ -1,8 +1,13 @@
+use std::collections::HashMap;
+
+use futures_util::StreamExt;
+
 use crate::config::CONFIG;
 
 pub struct Repo {
     pub name: String,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub archive_date: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 pub async fn get_all_repos() -> anyhow::Result<Vec<Repo>> {
@@ -46,13 +51,40 @@ pub async fn get_all_repos() -> anyhow::Result<Vec<Repo>> {
     }
 
     const MIN_UTC: chrono::DateTime<chrono::Utc> = chrono::DateTime::<chrono::Utc>::MIN_UTC;
+    let mut all_archive_dates = get_all_repo_archive_dates().await?;
 
     Ok(repos
         .into_iter()
         .map(|repo| Repo {
+            archive_date: all_archive_dates.remove(&repo.name),
             name: repo.name,
             updated_at: chrono::DateTime::parse_from_rfc3339(&repo.updated_at)
                 .map_or(MIN_UTC, |dt| dt.with_timezone(&chrono::Utc)),
         })
         .collect())
+}
+
+async fn get_all_repo_archive_dates()
+-> anyhow::Result<HashMap<String, chrono::DateTime<chrono::Utc>>> {
+    // list all archived repos in s3_object_store/prefix, the name is repo_name.tar.zst
+    let object_store = crate::s3::S3_OBJECT_STORE.lock().await;
+    let mut archive_dates = HashMap::new();
+    let prefix_path = object_store::path::Path::parse(&CONFIG.s3_path_prefix)?;
+    let mut stream = object_store.list(Some(&prefix_path));
+    while let Some(object) = stream.next().await {
+        let object = match object {
+            Ok(obj) => obj,
+            Err(e) => {
+                eprintln!("Failed to list object: {}", e);
+                continue;
+            }
+        };
+        let key = object.location.filename();
+        if let Some(key) = key {
+            if let Some(repo_name) = key.trim_matches('/').strip_suffix(".tar.zst") {
+                archive_dates.insert(repo_name.to_string(), object.last_modified);
+            }
+        }
+    }
+    Ok(archive_dates)
 }
