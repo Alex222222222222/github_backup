@@ -3,10 +3,14 @@ name = "github_backup"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "github_backup"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { version = "1.50", features = ["fs", "process", "macros", "rt-multi-thread"] }
 tokio-util = {version="0.7", features=["compat"] }
-reqwest = { version = "0.11", features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "charset"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
