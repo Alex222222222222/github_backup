@@ -1,9 +1,14 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf};
 
-use futures_util::StreamExt;
-use log::debug;
+use bytes::Bytes;
+use futures_util::{StreamExt, stream};
+use log::{debug, error};
+use object_store::{ObjectStoreExt, UploadPart};
+use tokio::io::AsyncReadExt;
 
 use crate::config::CONFIG;
+
+const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 pub struct Repo {
     pub name: String,
@@ -107,7 +112,7 @@ async fn get_all_repo_archive_dates()
         let object = match object {
             Ok(obj) => obj,
             Err(e) => {
-                eprintln!("Failed to list object: {}", e);
+                error!("Failed to list object: {}", e);
                 continue;
             }
         };
@@ -190,6 +195,90 @@ pub async fn archive_repo(repo: &Repo) -> anyhow::Result<()> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    Ok(())
+}
+
+pub async fn upload_archive(repo: &Repo) -> anyhow::Result<()> {
+    let archive_path = std::path::Path::new(&CONFIG.work_dir)
+        .join("archive")
+        .join(format!("{}.tar.zst", repo.name));
+    let archive_upload_path = object_store::path::Path::parse(&format!(
+        "{}/{}.tar.zst",
+        CONFIG.s3_path_prefix.trim_matches('/'),
+        repo.name
+    ))?;
+    upload_muiltipart(&archive_path, &archive_upload_path).await
+}
+
+pub async fn upload_muiltipart(
+    origin: &PathBuf,
+    target: &object_store::path::Path,
+) -> anyhow::Result<()> {
+    let object_store = crate::s3::S3_OBJECT_STORE.lock().await;
+    let mut put_multipart = object_store.put_multipart(target).await?;
+    // open the origin, and read it in 8MB chunks, and put it to s3_object_store
+    let mut file = tokio::fs::File::open(origin).await?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+    let (error_tx, mut error_rx) = tokio::sync::mpsc::channel::<anyhow::Error>(2);
+    let (tx_closed_indicater, rx_closed_indicater) = tokio::sync::oneshot::channel::<()>();
+
+    // spawn a task to wait for the rx to be closed, and then send a signal to the tx_closed_indicater
+    tokio::spawn(async move {
+        while let Some(f) = rx.recv().await {
+            let _ = f.await;
+        }
+        let _ = tx_closed_indicater.send(());
+    });
+
+    loop {
+        // check if there is any error from the error_rx, if there is, return the error
+        if let Ok(e) = error_rx.try_recv() {
+            return Err(e);
+        }
+
+        let mut buffer = vec![0u8; CHUNK_SIZE];
+        let n = file.read(&mut buffer).await?;
+        buffer.truncate(n);
+        debug!("Read {} bytes from file {}", n, origin.display());
+        if n == 0 {
+            break;
+        }
+        let b: Bytes = Bytes::from(buffer.into_boxed_slice());
+        let upload_part = put_multipart.put_part(object_store::PutPayload::from(b));
+        let error_tx_c = error_tx.clone();
+        let f = tokio::spawn(async move {
+            let r = upload_part.await;
+            if let Err(e) = r {
+                error!("Failed to upload part: {}", e);
+                let _ = error_tx_c.send(anyhow::anyhow!(e)).await;
+            }
+        });
+        tx.send(f).await?;
+    }
+    drop(tx); // closed the sender
+
+    // wait for the closed indicater to receive something, which means the rx is closed
+    let _ = rx_closed_indicater.await;
+    put_multipart.complete().await?;
+
+    Ok(())
+}
+
+pub async fn upload_muiltipart1(
+    origin: &PathBuf,
+    target: &object_store::path::Path,
+) -> anyhow::Result<()> {
+    let object_store = crate::s3::S3_OBJECT_STORE.lock().await;
+    // open the origin, and read it in 8MB chunks, and put it to s3_object_store
+    let mut file = tokio::fs::File::open(origin).await?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).await?;
+    let b: Bytes = Bytes::from(buffer.into_boxed_slice());
+    object_store
+        .put(&target, object_store::PutPayload::from(b))
+        .await
+        .unwrap();
 
     Ok(())
 }
