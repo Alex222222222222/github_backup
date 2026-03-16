@@ -17,3 +17,20 @@ S3 configuration through environment variables:
 - `S3_PATH_PREFIX`: The prefix for the backup files in the S3 bucket. Required. Should end with a slash (`/`). For example, `/github-backup/`.
 - `S3_VIRTUAL_HOSTED_STYLE_REQUEST`: Whether to use virtual hosted-style requests for S3. Default is `false`. If set to `true`, the bucket name will be included in the endpoint URL (e.g., `https://my-bucket.s3.amazonaws.com`). If set to `false`, the bucket name will be included in the request path (e.g., `https://s3.amazonaws.com/my-bucket`). Default is `false`.
 - `S3_REGION`: The region for the S3-compatible storage service. Optional. If not set, the script will attempt to guess the region automatically based on the endpoint URL and the bucket name.
+
+## Usage:
+
+Through docker:
+```bash
+docker run --rm \
+  -e GITHUB_USERNAME=your_github_username \
+  -e GITHUB_TOKEN=your_github_token \
+  -e S3_ENDPOINT=your_s3_endpoint \
+  -e S3_ACCESS_KEY_ID=your_s3_access_key_id \
+  -e S3_ACCESS_KEY=your_s3_access_key \
+  -e S3_BUCKET_NAME=your_s3_bucket_name \
+  -e S3_PATH_PREFIX=your_s3_path_prefix \
+  -e S3_VIRTUAL_HOSTED_STYLE_REQUEST=true \
+  -v /path/to/local/backup:/backup \
+  Alex222222222222/github-backup:latest
+```
