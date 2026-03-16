@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use futures_util::StreamExt;
+use log::debug;
 
 use crate::config::CONFIG;
 
@@ -9,8 +10,20 @@ pub struct Repo {
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub archive_date: Option<chrono::DateTime<chrono::Utc>>,
 }
+impl Repo {
+    fn url(&self) -> String {
+        format!(
+            "https://{}@github.com/{}/{}.git",
+            CONFIG.github_token, CONFIG.github_username, self.name
+        )
+    }
+}
 
 pub async fn get_all_repos() -> anyhow::Result<Vec<Repo>> {
+    debug!(
+        "Starting to fetch all repos for user {}",
+        CONFIG.github_username
+    );
     #[derive(serde::Deserialize)]
     struct RepoRaw {
         pub name: String,
@@ -33,18 +46,31 @@ pub async fn get_all_repos() -> anyhow::Result<Vec<Repo>> {
         );
         let response = client
             .get(&url)
-            .header("Authorization", format!("token {}", CONFIG.github_token))
+            .header(reqwest::header::USER_AGENT, "Alex222222222222")
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("token {}", CONFIG.github_token),
+            )
             .send()
             .await?;
 
         if !response.status().is_success() {
+            debug!(
+                "Failed to fetch repos from page {}: HTTP {}",
+                page,
+                response.status()
+            );
             break;
         }
 
         let mut page_repos: Vec<RepoRaw> = response.json().await?;
         if page_repos.is_empty() {
+            debug!("No more repos found on page {}, stopping fetch", page);
             break;
         }
+
+        debug!("Fetched {} repos from page {}", page_repos.len(), page);
 
         repos.append(&mut page_repos);
         page += 1;
@@ -52,6 +78,12 @@ pub async fn get_all_repos() -> anyhow::Result<Vec<Repo>> {
 
     const MIN_UTC: chrono::DateTime<chrono::Utc> = chrono::DateTime::<chrono::Utc>::MIN_UTC;
     let mut all_archive_dates = get_all_repo_archive_dates().await?;
+
+    debug!(
+        "Fetched {} repos, {} archived repos",
+        repos.len(),
+        all_archive_dates.len()
+    );
 
     Ok(repos
         .into_iter()
@@ -87,4 +119,55 @@ async fn get_all_repo_archive_dates()
         }
     }
     Ok(archive_dates)
+}
+
+pub async fn clone_repo(repo: &Repo) -> anyhow::Result<()> {
+    // make sure work_dir/clone exists
+    let clone_dir = std::path::Path::new(&CONFIG.work_dir).join("clone");
+    tokio::fs::create_dir_all(&clone_dir).await?;
+
+    // use tokio::Command to run git clone --mirror repo.url
+    let output = tokio::process::Command::new("git")
+        .arg("clone")
+        .arg("--mirror")
+        .arg(repo.url())
+        .current_dir(clone_dir)
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to clone repo {}: {}",
+            repo.name,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}
+
+pub async fn archive_repo(repo: &Repo) -> anyhow::Result<()> {
+    // tar --use-compress-program="zstd --ultra -22" -cf "work_dir/archive/$name.tar.zst" -C "work_dir/clone" "name.git"
+    // make sure work_dir/archive exists
+    let archive_dir = std::path::Path::new(&CONFIG.work_dir).join("archive");
+    tokio::fs::create_dir_all(&archive_dir).await?;
+    let output = tokio::process::Command::new("tar")
+        .arg("--use-compress-program=\"zstd --ultra -22\"")
+        .arg("-cf")
+        .arg(archive_dir.join(format!("{}.tar.zst", repo.name)))
+        .arg("-C")
+        .arg(std::path::Path::new(&CONFIG.work_dir).join("clone"))
+        .arg(format!("{}.git", repo.name))
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to archive repo {}: {}",
+            repo.name,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
 }
