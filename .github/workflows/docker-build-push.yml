@@ -49,5 +49,5 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: |
-            ghcr.io/Alex222222222222/github-backup:${{ steps.version.outputs.value }}
-            ghcr.io/Alex222222222222/github-backup:latest
+            ghcr.io/alex222222222222/github-backup:${{ steps.version.outputs.value }}
+            ghcr.io/alex222222222222/github-backup:latest
