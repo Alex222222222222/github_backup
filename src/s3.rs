@@ -1,24 +1,31 @@
-use object_store::aws::AmazonS3Builder;
+use opendal::Operator;
 
 use crate::config::CONFIG;
 
-pub static S3_OBJECT_STORE: once_cell::sync::Lazy<
-    tokio::sync::Mutex<std::sync::Arc<dyn object_store::ObjectStore>>,
-> = once_cell::sync::Lazy::new(|| {
-    create_remote_s3_object_store().expect("Failed to create remote S3 object store")
-});
-
-fn create_remote_s3_object_store()
--> anyhow::Result<tokio::sync::Mutex<std::sync::Arc<dyn object_store::ObjectStore>>> {
-    let mut store = AmazonS3Builder::new()
-        .with_endpoint(&CONFIG.s3_endpoint)
-        .with_access_key_id(&CONFIG.s3_access_key_id)
-        .with_secret_access_key(&CONFIG.s3_access_key)
-        .with_bucket_name(&CONFIG.s3_bucket_name)
-        .with_virtual_hosted_style_request(CONFIG.s3_virtual_hosted_style_request);
+pub async fn create_remote_s3_object_store() -> anyhow::Result<Operator> {
+    let mut store = opendal::services::S3::default()
+        .endpoint(&CONFIG.s3_endpoint)
+        .access_key_id(&CONFIG.s3_access_key_id)
+        .secret_access_key(&CONFIG.s3_access_key)
+        .bucket(&CONFIG.s3_bucket_name);
     if let Some(region) = CONFIG.s3_region.as_ref() {
-        store = store.with_region(region);
+        store = store.region(region);
+    } else {
+        let region =
+            opendal::services::S3::detect_region(&CONFIG.s3_endpoint, &CONFIG.s3_bucket_name).await;
+        if let Some(region) = region {
+            store = store.region(&region);
+        } else {
+            anyhow::bail!(
+                "Failed to detect S3 region for endpoint {} and bucket {}",
+                CONFIG.s3_endpoint,
+                CONFIG.s3_bucket_name
+            );
+        }
+    }
+    if CONFIG.s3_virtual_hosted_style_request {
+        store = store.enable_virtual_host_style();
     }
 
-    Ok(tokio::sync::Mutex::new(std::sync::Arc::new(store.build()?)))
+    Ok(Operator::new(store)?.finish())
 }

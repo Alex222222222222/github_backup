@@ -1,10 +1,9 @@
 use std::{collections::HashMap, path::PathBuf};
 
-use bytes::Bytes;
-use futures_util::{StreamExt, stream};
+use futures_util::{AsyncWriteExt, StreamExt};
 use log::{debug, error};
-use object_store::{ObjectStoreExt, UploadPart};
-use tokio::io::AsyncReadExt;
+use opendal::Operator;
+use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::config::CONFIG;
 
@@ -12,8 +11,8 @@ const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 pub struct Repo {
     pub name: String,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
-    pub archive_date: Option<chrono::DateTime<chrono::Utc>>,
+    pub updated_at: i64,
+    pub archive_date: Option<i64>,
 }
 impl Repo {
     fn url(&self) -> String {
@@ -24,7 +23,7 @@ impl Repo {
     }
 }
 
-pub async fn get_all_repos() -> anyhow::Result<Vec<Repo>> {
+pub async fn get_all_repos(object_store: &Operator) -> anyhow::Result<Vec<Repo>> {
     debug!(
         "Starting to fetch all repos for user {}",
         CONFIG.github_username
@@ -82,7 +81,7 @@ pub async fn get_all_repos() -> anyhow::Result<Vec<Repo>> {
     }
 
     const MIN_UTC: chrono::DateTime<chrono::Utc> = chrono::DateTime::<chrono::Utc>::MIN_UTC;
-    let mut all_archive_dates = get_all_repo_archive_dates().await?;
+    let mut all_archive_dates = get_all_repo_archive_dates(object_store).await?;
 
     debug!(
         "Fetched {} repos, {} archived repos",
@@ -93,22 +92,23 @@ pub async fn get_all_repos() -> anyhow::Result<Vec<Repo>> {
     Ok(repos
         .into_iter()
         .map(|repo| Repo {
-            archive_date: all_archive_dates.remove(&repo.name),
+            archive_date: all_archive_dates.remove(&repo.name).flatten(),
             name: repo.name,
             updated_at: chrono::DateTime::parse_from_rfc3339(&repo.updated_at)
-                .map_or(MIN_UTC, |dt| dt.with_timezone(&chrono::Utc)),
+                .map_or(MIN_UTC.timestamp(), |dt| {
+                    dt.with_timezone(&chrono::Utc).timestamp()
+                }),
         })
         .collect())
 }
 
-async fn get_all_repo_archive_dates()
--> anyhow::Result<HashMap<String, chrono::DateTime<chrono::Utc>>> {
+async fn get_all_repo_archive_dates(
+    object_store: &Operator,
+) -> anyhow::Result<HashMap<String, Option<i64>>> {
     // list all archived repos in s3_object_store/prefix, the name is repo_name.tar.zst
-    let object_store = crate::s3::S3_OBJECT_STORE.lock().await;
     let mut archive_dates = HashMap::new();
-    let prefix_path = object_store::path::Path::parse(&CONFIG.s3_path_prefix)?;
-    let mut stream = object_store.list(Some(&prefix_path));
-    while let Some(object) = stream.next().await {
+    let mut lister = object_store.lister(&CONFIG.s3_path_prefix).await?;
+    while let Some(object) = lister.next().await {
         let object = match object {
             Ok(obj) => obj,
             Err(e) => {
@@ -116,11 +116,15 @@ async fn get_all_repo_archive_dates()
                 continue;
             }
         };
-        let key = object.location.filename();
-        if let Some(key) = key {
-            if let Some(repo_name) = key.trim_matches('/').strip_suffix(".tar.zst") {
-                archive_dates.insert(repo_name.to_string(), object.last_modified);
-            }
+        let key = object.name();
+        if let Some(repo_name) = key.trim_matches('/').strip_suffix(".tar.zst") {
+            archive_dates.insert(
+                repo_name.to_string(),
+                object
+                    .metadata()
+                    .last_modified()
+                    .map(|t| t.into_inner().as_second()),
+            );
         }
     }
     Ok(archive_dates)
@@ -199,86 +203,32 @@ pub async fn archive_repo(repo: &Repo) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn upload_archive(repo: &Repo) -> anyhow::Result<()> {
+pub async fn upload_archive(object_store: &Operator, repo: &Repo) -> anyhow::Result<()> {
     let archive_path = std::path::Path::new(&CONFIG.work_dir)
         .join("archive")
         .join(format!("{}.tar.zst", repo.name));
-    let archive_upload_path = object_store::path::Path::parse(&format!(
+    let archive_upload_path = &format!(
         "{}/{}.tar.zst",
         CONFIG.s3_path_prefix.trim_matches('/'),
         repo.name
-    ))?;
-    upload_muiltipart(&archive_path, &archive_upload_path).await
+    );
+    upload_muiltipart(object_store, &archive_path, archive_upload_path).await
 }
 
 pub async fn upload_muiltipart(
+    object_store: &Operator,
     origin: &PathBuf,
-    target: &object_store::path::Path,
+    target: &str,
 ) -> anyhow::Result<()> {
-    let object_store = crate::s3::S3_OBJECT_STORE.lock().await;
-    let mut put_multipart = object_store.put_multipart(target).await?;
-    // open the origin, and read it in 8MB chunks, and put it to s3_object_store
-    let mut file = tokio::fs::File::open(origin).await?;
-    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
-    let (error_tx, mut error_rx) = tokio::sync::mpsc::channel::<anyhow::Error>(2);
-    let (tx_closed_indicater, rx_closed_indicater) = tokio::sync::oneshot::channel::<()>();
-
-    // spawn a task to wait for the rx to be closed, and then send a signal to the tx_closed_indicater
-    tokio::spawn(async move {
-        while let Some(f) = rx.recv().await {
-            let _ = f.await;
-        }
-        let _ = tx_closed_indicater.send(());
-    });
-
-    loop {
-        // check if there is any error from the error_rx, if there is, return the error
-        if let Ok(e) = error_rx.try_recv() {
-            return Err(e);
-        }
-
-        let mut buffer = vec![0u8; CHUNK_SIZE];
-        let n = file.read(&mut buffer).await?;
-        buffer.truncate(n);
-        debug!("Read {} bytes from file {}", n, origin.display());
-        if n == 0 {
-            break;
-        }
-        let b: Bytes = Bytes::from(buffer.into_boxed_slice());
-        let upload_part = put_multipart.put_part(object_store::PutPayload::from(b));
-        let error_tx_c = error_tx.clone();
-        let f = tokio::spawn(async move {
-            let r = upload_part.await;
-            if let Err(e) = r {
-                error!("Failed to upload part: {}", e);
-                let _ = error_tx_c.send(anyhow::anyhow!(e)).await;
-            }
-        });
-        tx.send(f).await?;
-    }
-    drop(tx); // closed the sender
-
-    // wait for the closed indicater to receive something, which means the rx is closed
-    let _ = rx_closed_indicater.await;
-    put_multipart.complete().await?;
-
-    Ok(())
-}
-
-pub async fn upload_muiltipart1(
-    origin: &PathBuf,
-    target: &object_store::path::Path,
-) -> anyhow::Result<()> {
-    let object_store = crate::s3::S3_OBJECT_STORE.lock().await;
-    // open the origin, and read it in 8MB chunks, and put it to s3_object_store
-    let mut file = tokio::fs::File::open(origin).await?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer).await?;
-    let b: Bytes = Bytes::from(buffer.into_boxed_slice());
-    object_store
-        .put(&target, object_store::PutPayload::from(b))
-        .await
-        .unwrap();
+    let mut writer = object_store
+        .writer_with(target)
+        .chunk(CHUNK_SIZE)
+        .concurrent(4)
+        .await?
+        .into_futures_async_write();
+    let mut file = tokio::fs::File::open(origin).await?.compat();
+    futures_util::io::copy(&mut file, &mut writer).await?;
+    writer.close().await?;
 
     Ok(())
 }
