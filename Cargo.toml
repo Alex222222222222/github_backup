@@ -17,3 +17,11 @@ futures-util = { version = "0.3", features = ["io"] }
 dotenv = "0.15"
 log = "0.4"
 env_logger = "0.11"
+
+[profile.release]
+opt-level = "z"      # or "s" (often a bit faster; slightly larger)
+lto = "fat"          # or true (thin LTO). fat usually smallest, slower build
+codegen-units = 1    # helps LTO + smaller binaries
+panic = "abort"      # removes unwinding machinery (big win), if acceptable
+strip = "symbols"    # stable on recent Rust; otherwise use `strip` tool
+debug = 0
