@@ -26,5 +26,8 @@ RUN chown -R app:app /app
 
 COPY --from=builder /app/target/release/github_backup /usr/local/bin/github_backup
 
+# set `RUST_LOG` to `info` by default, can be overridden by setting the environment variable when running the container
+ENV RUST_LOG=info
+
 USER app
 ENTRYPOINT ["github_backup"]

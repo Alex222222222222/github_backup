@@ -32,5 +32,10 @@ docker run --rm \
   -e S3_PATH_PREFIX=your_s3_path_prefix \
   -e S3_VIRTUAL_HOSTED_STYLE_REQUEST=true \
   -v /path/to/local/backup:/backup \
-  Alex222222222222/github-backup:latest
+  ghcr.io/alex222222222222/github-backup:latest
+```
+
+## Build Docker image locally:
+```bash
+docker build -t github-backup:local .
 ```
