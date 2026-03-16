@@ -126,6 +126,28 @@ pub async fn clone_repo(repo: &Repo) -> anyhow::Result<()> {
     let clone_dir = std::path::Path::new(&CONFIG.work_dir).join("clone");
     tokio::fs::create_dir_all(&clone_dir).await?;
 
+    // test if work_dir/clone/name.git already exists,
+    // if exists,`git -C "work_dir/clone/name.git" remote update`
+    let repo_dir = clone_dir.join(format!("{}.git", repo.name));
+    if repo_dir.exists() {
+        debug!("Repo {} already exists, updating remote", repo.name);
+        let output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo_dir)
+            .arg("remote")
+            .arg("update")
+            .output()
+            .await?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "Failed to update remote for repo {}: {}",
+                repo.name,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return Ok(());
+    }
+
     // use tokio::Command to run git clone --mirror repo.url
     let output = tokio::process::Command::new("git")
         .arg("clone")
@@ -147,12 +169,12 @@ pub async fn clone_repo(repo: &Repo) -> anyhow::Result<()> {
 }
 
 pub async fn archive_repo(repo: &Repo) -> anyhow::Result<()> {
-    // tar --use-compress-program="zstd --ultra -22" -cf "work_dir/archive/$name.tar.zst" -C "work_dir/clone" "name.git"
+    // tar --zstd -cf "work_dir/archive/$name.tar.zst" -C "work_dir/clone" "name.git"
     // make sure work_dir/archive exists
     let archive_dir = std::path::Path::new(&CONFIG.work_dir).join("archive");
     tokio::fs::create_dir_all(&archive_dir).await?;
     let output = tokio::process::Command::new("tar")
-        .arg("--use-compress-program=\"zstd --ultra -22\"")
+        .arg("--zstd")
         .arg("-cf")
         .arg(archive_dir.join(format!("{}.tar.zst", repo.name)))
         .arg("-C")
