@@ -165,10 +165,43 @@ pub async fn clone_repo(repo: &Repo) -> anyhow::Result<()> {
         .current_dir(clone_dir)
         .output()
         .await?;
-
     if !output.status.success() {
         anyhow::bail!(
             "Failed to clone repo {}: {}",
+            repo.name,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // gc the repo to reduce the size
+    let output = tokio::process::Command::new("git")
+        .arg("gc")
+        .arg("--aggressive")
+        .arg("--prune=now")
+        .current_dir(&repo_dir)
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to gc repo {}: {}",
+            repo.name,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // repack the repo to reduce the size
+    let output = tokio::process::Command::new("git")
+        .arg("repack")
+        .arg("-a")
+        .arg("-d")
+        .arg("--window=250")
+        .arg("--depth=250")
+        .current_dir(&repo_dir)
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to repack repo {}: {}",
             repo.name,
             String::from_utf8_lossy(&output.stderr)
         );
