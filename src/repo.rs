@@ -154,23 +154,22 @@ pub async fn clone_repo(repo: &Repo) -> anyhow::Result<()> {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        return Ok(());
-    }
-
-    // use tokio::Command to run git clone --mirror repo.url
-    let output = tokio::process::Command::new("git")
-        .arg("clone")
-        .arg("--mirror")
-        .arg(repo.url())
-        .current_dir(clone_dir)
-        .output()
-        .await?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "Failed to clone repo {}: {}",
-            repo.name,
-            String::from_utf8_lossy(&output.stderr)
-        );
+    } else {
+        // use tokio::Command to run git clone --mirror repo.url
+        let output = tokio::process::Command::new("git")
+            .arg("clone")
+            .arg("--mirror")
+            .arg(repo.url())
+            .current_dir(clone_dir)
+            .output()
+            .await?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "Failed to clone repo {}: {}",
+                repo.name,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     // gc the repo to reduce the size
