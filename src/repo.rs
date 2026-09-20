@@ -21,7 +21,11 @@ pub struct Repo {
 }
 impl Repo {
     fn url(&self) -> String {
-        github_repo_url(&CONFIG.github_username, &self.name)
+        let github = CONFIG
+            .github
+            .as_ref()
+            .expect("GitHub configuration is required for GitHub repositories");
+        github_repo_url(&github.username, &self.name)
     }
 }
 
@@ -40,9 +44,13 @@ fn configure_git_auth(command: &mut tokio::process::Command, token: &str) {
 }
 
 pub async fn get_all_repos(object_store: &Operator) -> anyhow::Result<Vec<Repo>> {
+    let Some(github) = CONFIG.github.as_ref() else {
+        return Ok(Vec::new());
+    };
+
     debug!(
         "Starting to fetch all repos for user {}",
-        CONFIG.github_username
+        github.username
     );
     #[derive(serde::Deserialize)]
     struct RepoRaw {
@@ -70,7 +78,7 @@ pub async fn get_all_repos(object_store: &Operator) -> anyhow::Result<Vec<Repo>>
             .header(reqwest::header::ACCEPT, "application/vnd.github+json")
             .header(
                 reqwest::header::AUTHORIZATION,
-                format!("token {}", CONFIG.github_token),
+                format!("token {}", github.token),
             )
             .send()
             .await?;
@@ -97,7 +105,8 @@ pub async fn get_all_repos(object_store: &Operator) -> anyhow::Result<Vec<Repo>>
     }
 
     const MIN_UTC: chrono::DateTime<chrono::Utc> = chrono::DateTime::<chrono::Utc>::MIN_UTC;
-    let mut all_archive_dates = get_all_repo_archive_dates(object_store).await?;
+    let mut all_archive_dates =
+        get_all_repo_archive_dates(object_store, &github.s3_path_prefix).await?;
 
     debug!(
         "Fetched {} repos, {} archived repos",
@@ -120,10 +129,11 @@ pub async fn get_all_repos(object_store: &Operator) -> anyhow::Result<Vec<Repo>>
 
 async fn get_all_repo_archive_dates(
     object_store: &Operator,
+    s3_path_prefix: &str,
 ) -> anyhow::Result<HashMap<String, Option<i64>>> {
     // list all archived repos in the S3 prefix; names may use the current or legacy suffix
     let mut archive_dates = HashMap::new();
-    let mut lister = object_store.lister(&CONFIG.s3_path_prefix).await?;
+    let mut lister = object_store.lister(s3_path_prefix).await?;
     while let Some(object) = lister.next().await {
         let object = match object {
             Ok(obj) => obj,
@@ -175,7 +185,11 @@ pub async fn clone_repo(repo: &Repo) -> anyhow::Result<()> {
         }
 
         let mut command = tokio::process::Command::new("git");
-        configure_git_auth(&mut command, &CONFIG.github_token);
+        let github = CONFIG
+            .github
+            .as_ref()
+            .expect("GitHub configuration is required for GitHub repositories");
+        configure_git_auth(&mut command, &github.token);
         let output = command
             .arg("-C")
             .arg(&repo_dir)
@@ -193,7 +207,11 @@ pub async fn clone_repo(repo: &Repo) -> anyhow::Result<()> {
     } else {
         // use tokio::Command to run git clone --mirror repo.url
         let mut command = tokio::process::Command::new("git");
-        configure_git_auth(&mut command, &CONFIG.github_token);
+        let github = CONFIG
+            .github
+            .as_ref()
+            .expect("GitHub configuration is required for GitHub repositories");
+        configure_git_auth(&mut command, &github.token);
         let output = command
             .arg("clone")
             .arg("--mirror")
@@ -273,9 +291,13 @@ pub async fn upload_archive(object_store: &Operator, repo: &Repo) -> anyhow::Res
     let archive_path = std::path::Path::new(&CONFIG.work_dir)
         .join("archive")
         .join(format!("{}{}", repo.name, archive_suffix));
+    let github = CONFIG
+        .github
+        .as_ref()
+        .expect("GitHub configuration is required for GitHub repositories");
     let archive_upload_path = &format!(
         "{}/{}{}",
-        CONFIG.s3_path_prefix.trim_matches('/'),
+        github.s3_path_prefix.trim_matches('/'),
         repo.name,
         archive_suffix
     );
