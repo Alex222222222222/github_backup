@@ -10,6 +10,8 @@ use crate::config::CONFIG;
 const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 const ARCHIVE_SUFFIX: &str = ".7z";
 const LEGACY_ARCHIVE_SUFFIX: &str = ".tar.zst";
+const GIT_TOKEN_ENV: &str = "GITHUB_BACKUP_GIT_TOKEN";
+const GIT_CREDENTIAL_HELPER_CONFIG: &str = "credential.helper=!f() { printf 'username=x-access-token\\npassword=%s\\n' \"$GITHUB_BACKUP_GIT_TOKEN\"; }; f";
 
 pub struct Repo {
     pub name: String,
@@ -18,11 +20,22 @@ pub struct Repo {
 }
 impl Repo {
     fn url(&self) -> String {
-        format!(
-            "https://{}@github.com/{}/{}.git",
-            CONFIG.github_token, CONFIG.github_username, self.name
-        )
+        github_repo_url(&CONFIG.github_username, &self.name)
     }
+}
+
+fn github_repo_url(username: &str, repo_name: &str) -> String {
+    format!("https://github.com/{username}/{repo_name}.git")
+}
+
+fn configure_git_auth(command: &mut tokio::process::Command, token: &str) {
+    command
+        .arg("-c")
+        .arg("credential.helper=")
+        .arg("-c")
+        .arg(GIT_CREDENTIAL_HELPER_CONFIG)
+        .env(GIT_TOKEN_ENV, token)
+        .env("GIT_TERMINAL_PROMPT", "0");
 }
 
 pub async fn get_all_repos(object_store: &Operator) -> anyhow::Result<Vec<Repo>> {
@@ -147,6 +160,25 @@ pub async fn clone_repo(repo: &Repo) -> anyhow::Result<()> {
             .arg("-C")
             .arg(&repo_dir)
             .arg("remote")
+            .arg("set-url")
+            .arg("origin")
+            .arg(repo.url())
+            .output()
+            .await?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "Failed to sanitize remote URL for repo {}: {}",
+                repo.name,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let mut command = tokio::process::Command::new("git");
+        configure_git_auth(&mut command, &CONFIG.github_token);
+        let output = command
+            .arg("-C")
+            .arg(&repo_dir)
+            .arg("remote")
             .arg("update")
             .output()
             .await?;
@@ -159,7 +191,9 @@ pub async fn clone_repo(repo: &Repo) -> anyhow::Result<()> {
         }
     } else {
         // use tokio::Command to run git clone --mirror repo.url
-        let output = tokio::process::Command::new("git")
+        let mut command = tokio::process::Command::new("git");
+        configure_git_auth(&mut command, &CONFIG.github_token);
+        let output = command
             .arg("clone")
             .arg("--mirror")
             .arg(repo.url())
@@ -334,7 +368,49 @@ pub async fn upload_muiltipart(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::process::{Command as StdCommand, Stdio};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn github_repo_url_does_not_include_credentials() {
+        let url = github_repo_url("example-user", "example");
+
+        assert_eq!(url, "https://github.com/example-user/example.git");
+        assert!(!url.contains('@'));
+    }
+
+    #[test]
+    fn git_credential_helper_returns_the_token_without_persisting_it_in_the_url() {
+        let mut child = StdCommand::new("git")
+            .args([
+                "-c",
+                "credential.helper=",
+                "-c",
+                GIT_CREDENTIAL_HELPER_CONFIG,
+                "credential",
+                "fill",
+            ])
+            .env(GIT_TOKEN_ENV, "synthetic-token")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"protocol=https\nhost=github.com\n\n")
+            .unwrap();
+
+        let output = child.wait_with_output().unwrap();
+        let credentials = String::from_utf8_lossy(&output.stdout);
+
+        assert!(output.status.success());
+        assert!(credentials.contains("username=x-access-token"));
+        assert!(credentials.contains("password=synthetic-token"));
+    }
 
     #[test]
     fn archive_repo_name_accepts_seven_zip_and_legacy_tar_zstd_objects() {
