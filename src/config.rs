@@ -13,6 +13,7 @@ pub struct GithubConfig {
 pub struct SshConfig {
     pub username: String,
     pub host: String,
+    pub port: u16,
     pub private_key_path: PathBuf,
     pub root_dir: String,
     pub s3_path_prefix: String,
@@ -64,6 +65,7 @@ impl Config {
         let ssh_private_key_path = non_empty_env(&mut get, "SSH_PRIVATE_KEY_PATH");
         let ssh_root_dir = non_empty_env(&mut get, "SSH_ROOT_DIR");
         let ssh_s3_path_prefix = non_empty_env(&mut get, "SSH_S3_PATH_PREFIX");
+        let ssh_port = non_empty_env(&mut get, "SSH_PORT");
         let ssh_values = [
             ("SSH_USERNAME", ssh_username.is_some()),
             ("SSH_HOST", ssh_host.is_some()),
@@ -86,6 +88,7 @@ impl Config {
             Some(SshConfig {
                 username: ssh_username.expect("validated SSH_USERNAME"),
                 host: ssh_host.expect("validated SSH_HOST"),
+                port: parse_ssh_port(ssh_port.as_deref())?,
                 private_key_path: PathBuf::from(
                     ssh_private_key_path.expect("validated SSH_PRIVATE_KEY_PATH"),
                 ),
@@ -127,6 +130,20 @@ impl Config {
             s3_region: get("S3_REGION").filter(|region| !region.is_empty()),
         })
     }
+}
+
+fn parse_ssh_port(value: Option<&str>) -> anyhow::Result<u16> {
+    let Some(value) = value else {
+        return Ok(22);
+    };
+
+    let port = value
+        .parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("SSH_PORT must be an integer between 1 and 65535"))?;
+    if port == 0 {
+        anyhow::bail!("SSH_PORT must be an integer between 1 and 65535");
+    }
+    Ok(port)
 }
 
 fn non_empty_env<F>(get: &mut F, name: &str) -> Option<String>
@@ -251,5 +268,48 @@ mod tests {
         let config = Config::from_env_with(github_environment()).unwrap();
 
         assert!(config.backup_password.is_empty());
+    }
+
+    #[test]
+    fn ssh_port_defaults_to_22() {
+        let config = Config::from_env_with(ssh_environment()).unwrap();
+
+        assert_eq!(config.ssh.unwrap().port, 22);
+    }
+
+    #[test]
+    fn ssh_port_is_configurable() {
+        let mut environment = base_environment();
+        environment.insert("SSH_USERNAME".into(), "backup".into());
+        environment.insert("SSH_HOST".into(), "git.example.test".into());
+        environment.insert(
+            "SSH_PRIVATE_KEY_PATH".into(),
+            "/run/secrets/id_ed25519".into(),
+        );
+        environment.insert("SSH_ROOT_DIR".into(), "/srv/git".into());
+        environment.insert("SSH_S3_PATH_PREFIX".into(), "ssh/".into());
+        environment.insert("SSH_PORT".into(), "2222".into());
+
+        let config = Config::from_env_with(|name| environment.get(name).cloned()).unwrap();
+
+        assert_eq!(config.ssh.unwrap().port, 2222);
+    }
+
+    #[test]
+    fn invalid_ssh_port_is_rejected() {
+        let mut environment = base_environment();
+        environment.insert("SSH_USERNAME".into(), "backup".into());
+        environment.insert("SSH_HOST".into(), "git.example.test".into());
+        environment.insert("SSH_PRIVATE_KEY_PATH".into(), "/run/secrets/key".into());
+        environment.insert("SSH_ROOT_DIR".into(), "/srv/git".into());
+        environment.insert("SSH_S3_PATH_PREFIX".into(), "ssh/".into());
+        environment.insert("SSH_PORT".into(), "0".into());
+
+        let error = match Config::from_env_with(|name| environment.get(name).cloned()) {
+            Ok(_) => panic!("invalid SSH port should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("SSH_PORT"));
     }
 }

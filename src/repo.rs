@@ -29,6 +29,7 @@ pub enum RepoSource {
     },
     Ssh {
         url: String,
+        port: u16,
         private_key_path: PathBuf,
         s3_path_prefix: String,
     },
@@ -223,6 +224,7 @@ async fn get_all_ssh_repos(object_store: &Operator) -> anyhow::Result<Vec<Repo>>
             archive_date: archive_dates.get(&name).copied().flatten(),
             source: RepoSource::Ssh {
                 url,
+                port: ssh_config.port,
                 private_key_path: ssh_config.private_key_path.clone(),
                 s3_path_prefix: ssh_config.s3_path_prefix.clone(),
             },
@@ -245,7 +247,7 @@ async fn probe_ssh_repository(
     url: &str,
 ) -> anyhow::Result<Option<String>> {
     let mut command = tokio::process::Command::new("git");
-    ssh::configure_git_ssh(&mut command, &config.private_key_path);
+    ssh::configure_git_ssh(&mut command, &config.private_key_path, config.port);
     let output = command.arg("ls-remote").arg("--").arg(url).output().await?;
     if output.status.success() {
         return Ok(Some(ssh::canonical_remote_ref_state(&output.stdout)));
@@ -478,8 +480,10 @@ fn authenticated_git_command(repo: &Repo) -> tokio::process::Command {
     match &repo.source {
         RepoSource::Github { token, .. } => configure_git_auth(&mut command, token),
         RepoSource::Ssh {
-            private_key_path, ..
-        } => ssh::configure_git_ssh(&mut command, private_key_path),
+            port,
+            private_key_path,
+            ..
+        } => ssh::configure_git_ssh(&mut command, private_key_path, *port),
     }
     command
 }
@@ -817,6 +821,7 @@ mod tests {
             archive_date: None,
             source: RepoSource::Ssh {
                 url: format!("backup@git.example.test:/srv/git/{name}"),
+                port: 2222,
                 private_key_path: "/run/secrets/id_ed25519".into(),
                 s3_path_prefix: s3_path_prefix.into(),
             },

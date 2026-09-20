@@ -12,13 +12,17 @@ use crate::config::SshConfig;
 pub async fn list_remote_directories(config: &SshConfig) -> anyhow::Result<Vec<String>> {
     let host = config.host.clone();
     let username = config.username.clone();
+    let port = config.port;
     let private_key_path = config.private_key_path.clone();
     let root_dir = config.root_dir.clone();
 
     let mut session = client::connect(
         Arc::new(client::Config::default()),
-        (host.as_str(), 22),
-        KnownHostsHandler { host: host.clone() },
+        (host.as_str(), port),
+        KnownHostsHandler {
+            host: host.clone(),
+            port,
+        },
     )
     .await
     .with_context(|| format!("failed to connect to SSH host {host}"))?;
@@ -83,12 +87,16 @@ pub fn git_remote_url(config: &SshConfig, repo_name: &str) -> String {
     )
 }
 
-pub fn configure_git_ssh(command: &mut tokio::process::Command, private_key_path: &Path) {
+pub fn configure_git_ssh(
+    command: &mut tokio::process::Command,
+    private_key_path: &Path,
+    port: u16,
+) {
     command
         .env(
             "GIT_SSH_COMMAND",
             format!(
-                "ssh -i {} -o IdentitiesOnly=yes -o BatchMode=yes",
+                "ssh -p {port} -i {} -o IdentitiesOnly=yes -o BatchMode=yes",
                 shell_quote(private_key_path)
             ),
         )
@@ -113,6 +121,7 @@ fn shell_quote(path: &Path) -> String {
 
 struct KnownHostsHandler {
     host: String,
+    port: u16,
 }
 
 impl client::Handler for KnownHostsHandler {
@@ -122,7 +131,7 @@ impl client::Handler for KnownHostsHandler {
         &mut self,
         server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        let known = keys::check_known_hosts(&self.host, 22, &server_public_key.public_key())
+        let known = keys::check_known_hosts(&self.host, self.port, &server_public_key.public_key())
             .with_context(|| format!("failed to read SSH known_hosts for {}", self.host))?;
         if !known {
             anyhow::bail!(
@@ -147,6 +156,7 @@ mod tests {
             private_key_path,
             root_dir: "/srv/git".into(),
             s3_path_prefix: "ssh/".into(),
+            port: 2222,
         }
     }
 
@@ -170,7 +180,11 @@ mod tests {
     #[test]
     fn ssh_git_command_quotes_identity_path() {
         let mut command = tokio::process::Command::new("git");
-        configure_git_ssh(&mut command, Path::new("/run/secrets/key with 'quote'"));
+        configure_git_ssh(
+            &mut command,
+            Path::new("/run/secrets/key with 'quote'"),
+            2222,
+        );
 
         let value = command
             .as_std()
@@ -183,6 +197,22 @@ mod tests {
         assert!(value.contains("IdentitiesOnly=yes"));
         assert!(value.contains("BatchMode=yes"));
         assert!(value.contains("key with"));
+    }
+
+    #[test]
+    fn ssh_git_command_includes_configured_port() {
+        let mut command = tokio::process::Command::new("git");
+        configure_git_ssh(&mut command, Path::new("/run/secrets/id_ed25519"), 2222);
+
+        let value = command
+            .as_std()
+            .get_envs()
+            .find(|(name, _)| *name == "GIT_SSH_COMMAND")
+            .and_then(|(_, value)| value)
+            .unwrap()
+            .to_string_lossy();
+
+        assert!(value.contains("-p 2222"));
     }
 
     #[test]
