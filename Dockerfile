@@ -18,7 +18,7 @@ FROM alpine:latest AS runner
 WORKDIR /app
 
 # Common runtime deps (adjust as needed)
-RUN apk add --no-cache ca-certificates git 7zip
+RUN apk add --no-cache ca-certificates git 7zip gnupg
 
 RUN addgroup -S app && adduser -S app -G app
 # Fix /app dir permissions for the app user

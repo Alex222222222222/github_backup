@@ -6,6 +6,7 @@ pub struct Config {
     pub github_username: String,
     pub github_token: String,
     pub backup_password: String,
+    pub gpg_public_key_dir: Option<String>,
     pub per_page: usize,
     pub work_dir: String,
 
@@ -23,6 +24,9 @@ impl Config {
             github_username: std::env::var("GITHUB_USERNAME")?,
             github_token: std::env::var("GITHUB_TOKEN")?,
             backup_password: std::env::var("BACKUP_PASSWORD").unwrap_or_default(),
+            gpg_public_key_dir: std::env::var("GPG_PUBLIC_KEY_DIR")
+                .ok()
+                .filter(|path| !path.is_empty()),
             per_page: std::env::var("PER_PAGE")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())

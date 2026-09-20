@@ -5,7 +5,8 @@ A rust script to backup all repositories of a GitHub user.
 Enviroment variables:
 - `GITHUB_USERNAME`: The GitHub username to backup.
 - `GITHUB_TOKEN`: The GitHub personal access token with `repo` scope to access the repositories.
-- `BACKUP_PASSWORD`: Optional password for new `.7z` backup archives. If empty or unset, archives are not encrypted.
+- `BACKUP_PASSWORD`: Optional password for the 7z layer of new backups. If empty or unset, the 7z layer is not password-protected; a separate GPG layer can still be enabled with `GPG_PUBLIC_KEY_DIR`.
+- `GPG_PUBLIC_KEY_DIR`: Optional directory containing one exported GPG public key per regular file. If set, new archives are written as `.7z.gpg` and every listed public key can decrypt them. If both this and `BACKUP_PASSWORD` are configured, both credentials are required to restore a backup.
 - `WORK_DIR`: The directory for temporary files and logs. Default is `./backup`.
 - `PER_PAGE`: The number of repositories to fetch from GitHub api per page. Default is `100`.
 - `RUST_LOG`: The log level for the script. Default is `info`.
@@ -27,6 +28,7 @@ docker run --rm \
   -e GITHUB_USERNAME=your_github_username \
   -e GITHUB_TOKEN=your_github_token \
   -e BACKUP_PASSWORD=your_backup_password \
+  -e GPG_PUBLIC_KEY_DIR=/gpg-public-keys \
   -e S3_ENDPOINT=your_s3_endpoint \
   -e S3_ACCESS_KEY_ID=your_s3_access_key_id \
   -e S3_ACCESS_KEY=your_s3_access_key \
@@ -34,6 +36,7 @@ docker run --rm \
   -e S3_PATH_PREFIX=your_s3_path_prefix \
   -e S3_VIRTUAL_HOSTED_STYLE_REQUEST=true \
   -v /path/to/local/backup:/backup \
+  -v /path/to/gpg-public-keys:/gpg-public-keys:ro \
   ghcr.io/alex222222222222/github-backup:latest
 ```
 
@@ -42,10 +45,13 @@ docker run --rm \
 docker build -t github-backup:local .
 ```
 
-New backups are stored as `.7z` files. If `BACKUP_PASSWORD` is non-empty, they are password-protected. Extract one manually with:
+New backups are stored as `.7z` files when `GPG_PUBLIC_KEY_DIR` is unset. If `BACKUP_PASSWORD` is non-empty, they are password-protected. When `GPG_PUBLIC_KEY_DIR` is set, the `.7z` file is additionally encrypted with every public key in that directory and uploaded as `.7z.gpg`. This makes restoration require the corresponding GPG private key and, when configured, the 7z password.
 
 ```bash
+gpg --output repository.7z --decrypt repository.7z.gpg
 7zz x repository.7z
 ```
 
-Existing `.tar.zst` objects remain recognized. They are reused until the corresponding GitHub repository changes, at which point a new `.7z` archive is uploaded.
+When `BACKUP_PASSWORD` was configured, `7zz` prompts for it during extraction. With multiple configured public keys, any one of the corresponding private keys can decrypt the GPG layer.
+
+Existing `.tar.zst`, `.7z`, and `.7z.gpg` objects remain recognized. They are reused until the corresponding GitHub repository changes, at which point a new archive using the current configuration is uploaded.

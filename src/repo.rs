@@ -9,6 +9,7 @@ use crate::config::CONFIG;
 
 const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 const ARCHIVE_SUFFIX: &str = ".7z";
+const GPG_ARCHIVE_SUFFIX: &str = ".7z.gpg";
 const LEGACY_ARCHIVE_SUFFIX: &str = ".tar.zst";
 const GIT_TOKEN_ENV: &str = "GITHUB_BACKUP_GIT_TOKEN";
 const GIT_CREDENTIAL_HELPER_CONFIG: &str = "credential.helper=!f() { printf 'username=x-access-token\\npassword=%s\\n' \"$GITHUB_BACKUP_GIT_TOKEN\"; }; f";
@@ -249,32 +250,81 @@ pub async fn clone_repo(repo: &Repo) -> anyhow::Result<()> {
 pub async fn archive_repo(repo: &Repo) -> anyhow::Result<()> {
     let archive_dir = std::path::Path::new(&CONFIG.work_dir).join("archive");
     let clone_dir = std::path::Path::new(&CONFIG.work_dir).join("clone");
+
+    let gpg_key_files = configured_gpg_key_files()?;
     archive_repo_at(
         &archive_dir,
         &clone_dir,
         &repo.name,
         &CONFIG.backup_password,
     )
-    .await
+    .await?;
+
+    if let Some(gpg_key_files) = gpg_key_files {
+        let archive_path = archive_dir.join(format!("{}{}", repo.name, ARCHIVE_SUFFIX));
+        encrypt_archive_with_gpg(&archive_path, &gpg_key_files).await?;
+    }
+
+    Ok(())
 }
 
 pub async fn upload_archive(object_store: &Operator, repo: &Repo) -> anyhow::Result<()> {
+    let archive_suffix = current_archive_suffix();
     let archive_path = std::path::Path::new(&CONFIG.work_dir)
         .join("archive")
-        .join(format!("{}{}", repo.name, ARCHIVE_SUFFIX));
+        .join(format!("{}{}", repo.name, archive_suffix));
     let archive_upload_path = &format!(
         "{}/{}{}",
         CONFIG.s3_path_prefix.trim_matches('/'),
         repo.name,
-        ARCHIVE_SUFFIX
+        archive_suffix
     );
     upload_muiltipart(object_store, &archive_path, archive_upload_path).await
 }
 
 fn archive_repo_name_from_object_key(key: &str) -> Option<&str> {
     let key = key.trim_matches('/');
-    key.strip_suffix(ARCHIVE_SUFFIX)
+    key.strip_suffix(GPG_ARCHIVE_SUFFIX)
+        .or_else(|| key.strip_suffix(ARCHIVE_SUFFIX))
         .or_else(|| key.strip_suffix(LEGACY_ARCHIVE_SUFFIX))
+}
+
+fn current_archive_suffix() -> &'static str {
+    if CONFIG.gpg_public_key_dir.is_some() {
+        GPG_ARCHIVE_SUFFIX
+    } else {
+        ARCHIVE_SUFFIX
+    }
+}
+
+fn configured_gpg_key_files() -> anyhow::Result<Option<Vec<PathBuf>>> {
+    let Some(directory) = CONFIG.gpg_public_key_dir.as_deref() else {
+        return Ok(None);
+    };
+
+    Ok(Some(discover_gpg_key_files(std::path::Path::new(
+        directory,
+    ))?))
+}
+
+fn discover_gpg_key_files(directory: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut key_files = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.is_file() {
+            key_files.push(path);
+        }
+    }
+    key_files.sort();
+
+    if key_files.is_empty() {
+        anyhow::bail!(
+            "GPG_PUBLIC_KEY_DIR {} does not contain any regular key files",
+            directory.display()
+        );
+    }
+
+    Ok(key_files)
 }
 
 fn record_archive_date(
@@ -337,6 +387,70 @@ async fn archive_repo_at(
     }
 
     tokio::fs::rename(temporary_archive_path, archive_path).await?;
+    Ok(())
+}
+
+async fn encrypt_archive_with_gpg(
+    archive_path: &std::path::Path,
+    key_files: &[PathBuf],
+) -> anyhow::Result<()> {
+    if key_files.is_empty() {
+        anyhow::bail!("at least one GPG public key file is required");
+    }
+
+    let archive_path = absolute_path(archive_path)?;
+    let encrypted_archive_path = archive_path.with_file_name(format!(
+        "{}{}",
+        archive_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("archive path has no valid file name"))?,
+        ".gpg"
+    ));
+    let temporary_encrypted_archive_path =
+        PathBuf::from(format!("{}.part", encrypted_archive_path.display()));
+    let _ = tokio::fs::remove_file(&temporary_encrypted_archive_path).await;
+
+    let mut command = tokio::process::Command::new("gpg");
+    command
+        .arg("--no-options")
+        .arg("--no-default-keyring")
+        .arg("--batch")
+        .arg("--yes")
+        .arg("--no-tty")
+        .arg("--encrypt");
+    for key_file in key_files {
+        command
+            .arg("--recipient-file")
+            .arg(absolute_path(key_file)?);
+    }
+    let output = command
+        .arg("--output")
+        .arg(&temporary_encrypted_archive_path)
+        .arg(&archive_path)
+        .output()
+        .await;
+
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temporary_encrypted_archive_path).await;
+            let _ = tokio::fs::remove_file(&archive_path).await;
+            return Err(error.into());
+        }
+    };
+
+    if !output.status.success() {
+        let _ = tokio::fs::remove_file(&temporary_encrypted_archive_path).await;
+        let _ = tokio::fs::remove_file(&archive_path).await;
+        anyhow::bail!(
+            "Failed to encrypt archive with GPG: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    tokio::fs::rename(temporary_encrypted_archive_path, encrypted_archive_path).await?;
+    tokio::fs::remove_file(archive_path).await?;
     Ok(())
 }
 
@@ -419,6 +533,10 @@ mod tests {
             Some("example")
         );
         assert_eq!(
+            archive_repo_name_from_object_key("example.7z.gpg"),
+            Some("example")
+        );
+        assert_eq!(
             archive_repo_name_from_object_key("example.tar.zst"),
             Some("example")
         );
@@ -439,6 +557,27 @@ mod tests {
         record_archive_date(&mut archive_dates, "example", Some(20));
 
         assert_eq!(archive_dates.get("example"), Some(&Some(20)));
+    }
+
+    #[test]
+    fn gpg_key_files_are_discovered_in_stable_order() {
+        let root = std::env::temp_dir().join(format!(
+            "github-backup-gpg-key-discovery-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("z.asc"), b"z").unwrap();
+        std::fs::write(root.join("a.asc"), b"a").unwrap();
+        std::fs::create_dir(root.join("nested")).unwrap();
+
+        let key_files = discover_gpg_key_files(&root).unwrap();
+
+        assert_eq!(key_files, vec![root.join("a.asc"), root.join("z.asc")]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -546,4 +685,157 @@ mod tests {
 
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
+
+    #[tokio::test]
+    #[ignore = "requires the 7zz and gpg runtime dependencies"]
+    async fn layered_encryption_supports_multiple_public_key_files() {
+        let temp_dir = if std::path::Path::new("/private/tmp").is_dir() {
+            PathBuf::from("/private/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let root = temp_dir.join(format!(
+            "gbg-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first_home = root.join("first-home");
+        let second_home = root.join("second-home");
+        let first_key = root.join("first.asc");
+        let second_key = root.join("second.asc");
+        let clone_dir = root.join("clone");
+        let archive_dir = root.join("archive");
+        let repo_dir = clone_dir.join("example.git");
+        let archive = archive_dir.join("example.7z");
+        let encrypted_archive = archive_dir.join("example.7z.gpg");
+
+        std::fs::create_dir_all(&first_home).unwrap();
+        std::fs::create_dir_all(&second_home).unwrap();
+        set_secure_permissions(&first_home);
+        set_secure_permissions(&second_home);
+
+        generate_gpg_key(&first_home, "First Test <first@example.com>");
+        generate_gpg_key(&second_home, "Second Test <second@example.com>");
+        export_gpg_key(&first_home, "First Test <first@example.com>", &first_key);
+        export_gpg_key(
+            &second_home,
+            "Second Test <second@example.com>",
+            &second_key,
+        );
+        tokio::fs::create_dir_all(&repo_dir).await.unwrap();
+        tokio::fs::write(repo_dir.join("marker.txt"), "backup test")
+            .await
+            .unwrap();
+        archive_repo_at(&archive_dir, &clone_dir, "example", "test backup password")
+            .await
+            .unwrap();
+
+        encrypt_archive_with_gpg(&archive, &[first_key, second_key])
+            .await
+            .unwrap();
+
+        assert!(encrypted_archive.exists());
+        assert!(!archive.exists());
+
+        for (home, output_path) in [
+            (&first_home, root.join("first-decrypted.7z")),
+            (&second_home, root.join("second-decrypted.7z")),
+        ] {
+            let output = gpg_command(home)
+                .arg("--output")
+                .arg(&output_path)
+                .arg("--decrypt")
+                .arg(&encrypted_archive)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "gpg failed to decrypt: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let correct_password = tokio::process::Command::new("7zz")
+                .arg("t")
+                .arg("-ptest backup password")
+                .arg(&output_path)
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                correct_password.status.success(),
+                "7zz failed to test the decrypted archive: {}",
+                String::from_utf8_lossy(&correct_password.stderr)
+            );
+        }
+
+        let wrong_password = tokio::process::Command::new("7zz")
+            .arg("t")
+            .arg("-pwrong password")
+            .arg(root.join("first-decrypted.7z"))
+            .output()
+            .await
+            .unwrap();
+        assert!(!wrong_password.status.success());
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    fn gpg_command(home: &std::path::Path) -> StdCommand {
+        let mut command = StdCommand::new("gpg");
+        command
+            .arg("--no-options")
+            .arg("--batch")
+            .arg("--homedir")
+            .arg(home);
+        command
+    }
+
+    fn generate_gpg_key(home: &std::path::Path, identity: &str) {
+        let output = gpg_command(home)
+            .arg("--pinentry-mode")
+            .arg("loopback")
+            .arg("--passphrase")
+            .arg("")
+            .arg("--quick-generate-key")
+            .arg(identity)
+            .arg("rsa2048")
+            .arg("encrypt")
+            .arg("1d")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "gpg key generation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn export_gpg_key(home: &std::path::Path, identity: &str, output_path: &std::path::Path) {
+        let output = gpg_command(home)
+            .arg("--armor")
+            .arg("--export")
+            .arg("--output")
+            .arg(output_path)
+            .arg(identity)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "gpg public-key export failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    fn set_secure_permissions(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn set_secure_permissions(_path: &std::path::Path) {}
 }
