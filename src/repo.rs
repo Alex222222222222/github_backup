@@ -48,10 +48,7 @@ pub async fn get_all_repos(object_store: &Operator) -> anyhow::Result<Vec<Repo>>
         return Ok(Vec::new());
     };
 
-    debug!(
-        "Starting to fetch all repos for user {}",
-        github.username
-    );
+    debug!("Starting to fetch all repos for user {}", github.username);
     #[derive(serde::Deserialize)]
     struct RepoRaw {
         pub name: String,

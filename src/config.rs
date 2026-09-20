@@ -166,7 +166,10 @@ mod tests {
         let mut environment = base_environment();
         environment.insert("SSH_USERNAME".into(), "backup".into());
         environment.insert("SSH_HOST".into(), "git.example.test".into());
-        environment.insert("SSH_PRIVATE_KEY_PATH".into(), "/run/secrets/id_ed25519".into());
+        environment.insert(
+            "SSH_PRIVATE_KEY_PATH".into(),
+            "/run/secrets/id_ed25519".into(),
+        );
         environment.insert("SSH_ROOT_DIR".into(), "/srv/git".into());
         environment.insert("SSH_S3_PATH_PREFIX".into(), "ssh/".into());
         move |name| environment.get(name).cloned()
@@ -179,7 +182,10 @@ mod tests {
         environment.insert("S3_PATH_PREFIX".into(), "github/".into());
         environment.insert("SSH_USERNAME".into(), "backup".into());
         environment.insert("SSH_HOST".into(), "git.example.test".into());
-        environment.insert("SSH_PRIVATE_KEY_PATH".into(), "/run/secrets/id_ed25519".into());
+        environment.insert(
+            "SSH_PRIVATE_KEY_PATH".into(),
+            "/run/secrets/id_ed25519".into(),
+        );
         environment.insert("SSH_ROOT_DIR".into(), "/srv/git".into());
         environment.insert("SSH_S3_PATH_PREFIX".into(), "ssh/".into());
         move |name| environment.get(name).cloned()

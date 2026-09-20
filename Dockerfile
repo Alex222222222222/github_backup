@@ -18,9 +18,10 @@ FROM alpine:latest AS runner
 WORKDIR /app
 
 # Common runtime deps (adjust as needed)
-RUN apk add --no-cache ca-certificates git 7zip gnupg
+RUN apk add --no-cache ca-certificates git openssh-client 7zip gnupg
 
 RUN addgroup -S app && adduser -S app -G app
+RUN mkdir -p /home/app/.ssh && chown -R app:app /home/app
 # Fix /app dir permissions for the app user
 RUN chown -R app:app /app
 
