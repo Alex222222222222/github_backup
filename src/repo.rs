@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::Context;
 use futures_util::{AsyncWriteExt, StreamExt};
-use log::{debug, error};
+use log::{debug, error, info};
 use opendal::Operator;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
@@ -115,7 +115,10 @@ async fn get_all_github_repos(object_store: &Operator) -> anyhow::Result<Vec<Rep
         return Ok(Vec::new());
     };
 
-    debug!("Starting to fetch all repos for user {}", github.username);
+    info!(
+        "Discovering GitHub repositories for user {}",
+        github.username
+    );
     #[derive(serde::Deserialize)]
     struct RepoRaw {
         pub name: String,
@@ -172,8 +175,8 @@ async fn get_all_github_repos(object_store: &Operator) -> anyhow::Result<Vec<Rep
     let mut all_archive_dates =
         get_all_repo_archive_dates(object_store, &github.s3_path_prefix).await?;
 
-    debug!(
-        "Fetched {} repos, {} archived repos",
+    info!(
+        "Discovered {} GitHub repositories, {} with existing archives",
         repos.len(),
         all_archive_dates.len()
     );
@@ -209,6 +212,14 @@ async fn get_all_ssh_repos(object_store: &Operator) -> anyhow::Result<Vec<Repo>>
     };
 
     let explicit_repositories = ssh_config.repositories.is_some();
+    if explicit_repositories {
+        info!("Using explicit SSH repository list; skipping SFTP discovery");
+    } else {
+        info!(
+            "Discovering SSH repositories under {} through SFTP",
+            ssh_config.root_dir
+        );
+    }
     let repository_paths = match ssh_config.repositories.as_ref() {
         Some(repositories) => repositories.clone(),
         None => ssh::list_remote_directories(ssh_config).await?,
@@ -253,7 +264,7 @@ async fn get_all_ssh_repos(object_store: &Operator) -> anyhow::Result<Vec<Repo>>
         });
     }
 
-    debug!(
+    info!(
         "Discovered {} SSH repositories under {}",
         repos.len(),
         ssh_config.root_dir
@@ -363,7 +374,7 @@ pub async fn clone_repo(repo: &Repo) -> anyhow::Result<Option<String>> {
 
     let repo_dir = clone_dir.join(format!("{}.git", repo.name));
     if repo_dir.exists() {
-        debug!("Repo {} already exists, updating remote", repo.name);
+        info!("Updating existing mirror for repo {}", repo.name);
         let output = tokio::process::Command::new("git")
             .arg("-C")
             .arg(&repo_dir)
@@ -398,6 +409,7 @@ pub async fn clone_repo(repo: &Repo) -> anyhow::Result<Option<String>> {
             );
         }
     } else {
+        info!("Cloning mirror for repo {}", repo.name);
         let mut command = authenticated_git_command(repo);
         let output = command
             .arg("clone")
@@ -463,6 +475,12 @@ pub async fn archive_repo(repo: &Repo) -> anyhow::Result<()> {
     let clone_dir = clone_dir_for(repo);
 
     let gpg_key_files = configured_gpg_key_files()?;
+    info!(
+        "Creating 7z archive for repo {} (password encryption: {}, GPG encryption: {})",
+        repo.name,
+        !CONFIG.backup_password.is_empty(),
+        gpg_key_files.is_some()
+    );
     archive_repo_at(
         &archive_dir,
         &clone_dir,
@@ -472,6 +490,11 @@ pub async fn archive_repo(repo: &Repo) -> anyhow::Result<()> {
     .await?;
 
     if let Some(gpg_key_files) = gpg_key_files {
+        info!(
+            "Applying GPG encryption to repo {} archive with {} public key file(s)",
+            repo.name,
+            gpg_key_files.len()
+        );
         let archive_path = archive_dir.join(format!("{}{}", repo.name, ARCHIVE_SUFFIX));
         encrypt_archive_with_gpg(&archive_path, &gpg_key_files).await?;
     }
@@ -483,6 +506,10 @@ pub async fn upload_archive(object_store: &Operator, repo: &Repo) -> anyhow::Res
     let archive_suffix = current_archive_suffix();
     let archive_path = archive_dir_for(repo).join(format!("{}{}", repo.name, archive_suffix));
     let archive_upload_path = archive_object_key_with_suffix(repo, archive_suffix);
+    info!(
+        "{}",
+        upload_log_message("archive", repo, &archive_upload_path)
+    );
     upload_muiltipart(object_store, &archive_path, &archive_upload_path).await
 }
 
@@ -491,11 +518,10 @@ pub async fn upload_state(object_store: &Operator, repo: &Repo, state: &str) -> 
         return Ok(());
     }
 
+    let state_upload_path = source_object_key(repo.s3_path_prefix(), &repo.name, SSH_STATE_SUFFIX);
+    info!("{}", upload_log_message("state", repo, &state_upload_path));
     object_store
-        .write(
-            &source_object_key(repo.s3_path_prefix(), &repo.name, SSH_STATE_SUFFIX),
-            state.as_bytes().to_vec(),
-        )
+        .write(&state_upload_path, state.as_bytes().to_vec())
         .await?;
     Ok(())
 }
@@ -575,6 +601,13 @@ fn source_object_key(prefix: &str, repo_name: &str, suffix: &str) -> String {
     } else {
         format!("{prefix}/{repo_name}{suffix}")
     }
+}
+
+fn upload_log_message(kind: &str, repo: &Repo, target: &str) -> String {
+    format!(
+        "Uploading {kind} for repo {} to S3 object {target}",
+        repo.name
+    )
 }
 
 fn archive_repo_name_from_object_key(key: &str) -> Option<&str> {
@@ -871,6 +904,16 @@ mod tests {
         assert_ne!(archive_path_for(&github), archive_path_for(&ssh));
         assert_eq!(archive_object_key(&github), "github/project.7z");
         assert_eq!(archive_object_key(&ssh), "ssh/project.7z");
+    }
+
+    #[test]
+    fn upload_log_message_names_the_repo_and_s3_object() {
+        let repo = test_ssh_repo("project", "ssh/");
+
+        assert_eq!(
+            upload_log_message("archive", &repo, "ssh/project.7z"),
+            "Uploading archive for repo project to S3 object ssh/project.7z"
+        );
     }
 
     #[test]
