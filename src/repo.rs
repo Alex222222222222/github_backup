@@ -1,31 +1,89 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use futures_util::{AsyncWriteExt, StreamExt};
 use log::{debug, error};
 use opendal::Operator;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
-use crate::config::CONFIG;
+use crate::{
+    config::{CONFIG, SshConfig},
+    ssh,
+};
 
 const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 const ARCHIVE_SUFFIX: &str = ".7z";
 const GPG_ARCHIVE_SUFFIX: &str = ".7z.gpg";
 const LEGACY_ARCHIVE_SUFFIX: &str = ".tar.zst";
+const SSH_STATE_SUFFIX: &str = ".state";
 const GIT_TOKEN_ENV: &str = "GITHUB_BACKUP_GIT_TOKEN";
 const GIT_CREDENTIAL_HELPER_CONFIG: &str = "credential.helper=!f() { printf 'username=x-access-token\\npassword=%s\\n' \"$GITHUB_BACKUP_GIT_TOKEN\"; }; f";
 
+pub enum RepoSource {
+    Github {
+        url: String,
+        token: String,
+        s3_path_prefix: String,
+    },
+    Ssh {
+        url: String,
+        private_key_path: PathBuf,
+        s3_path_prefix: String,
+    },
+}
+
 pub struct Repo {
     pub name: String,
-    pub updated_at: i64,
+    pub updated_at: Option<i64>,
     pub archive_date: Option<i64>,
+    pub source: RepoSource,
+    pub remote_state: Option<String>,
+    pub archived_state: Option<String>,
 }
 impl Repo {
     fn url(&self) -> String {
-        let github = CONFIG
-            .github
-            .as_ref()
-            .expect("GitHub configuration is required for GitHub repositories");
-        github_repo_url(&github.username, &self.name)
+        match &self.source {
+            RepoSource::Github { url, .. } | RepoSource::Ssh { url, .. } => url.clone(),
+        }
+    }
+
+    fn s3_path_prefix(&self) -> &str {
+        match &self.source {
+            RepoSource::Github { s3_path_prefix, .. } | RepoSource::Ssh { s3_path_prefix, .. } => {
+                s3_path_prefix
+            }
+        }
+    }
+
+    fn namespace(&self) -> &'static str {
+        match &self.source {
+            RepoSource::Github { .. } => "github",
+            RepoSource::Ssh { .. } => "ssh",
+        }
+    }
+
+    fn is_ssh(&self) -> bool {
+        matches!(&self.source, RepoSource::Ssh { .. })
+    }
+
+    pub fn needs_backup(&self) -> bool {
+        match &self.source {
+            RepoSource::Github { .. } => {
+                self.archive_date.is_none()
+                    || self
+                        .updated_at
+                        .zip(self.archive_date)
+                        .map(|(updated_at, archive_date)| archive_date < updated_at)
+                        .unwrap_or(true)
+            }
+            RepoSource::Ssh { .. } => {
+                self.archive_date.is_none()
+                    || self.remote_state.is_none()
+                    || self.remote_state != self.archived_state
+            }
+        }
     }
 }
 
@@ -44,6 +102,12 @@ fn configure_git_auth(command: &mut tokio::process::Command, token: &str) {
 }
 
 pub async fn get_all_repos(object_store: &Operator) -> anyhow::Result<Vec<Repo>> {
+    let mut repos = get_all_github_repos(object_store).await?;
+    repos.extend(get_all_ssh_repos(object_store).await?);
+    Ok(repos)
+}
+
+async fn get_all_github_repos(object_store: &Operator) -> anyhow::Result<Vec<Repo>> {
     let Some(github) = CONFIG.github.as_ref() else {
         return Ok(Vec::new());
     };
@@ -113,15 +177,91 @@ pub async fn get_all_repos(object_store: &Operator) -> anyhow::Result<Vec<Repo>>
 
     Ok(repos
         .into_iter()
-        .map(|repo| Repo {
-            archive_date: all_archive_dates.remove(&repo.name).flatten(),
-            name: repo.name,
-            updated_at: chrono::DateTime::parse_from_rfc3339(&repo.updated_at)
-                .map_or(MIN_UTC.timestamp(), |dt| {
-                    dt.with_timezone(&chrono::Utc).timestamp()
-                }),
+        .map(|repo| {
+            let name = repo.name;
+            Repo {
+                archive_date: all_archive_dates.remove(&name).flatten(),
+                name: name.clone(),
+                updated_at: Some(
+                    chrono::DateTime::parse_from_rfc3339(&repo.updated_at)
+                        .map_or(MIN_UTC.timestamp(), |dt| {
+                            dt.with_timezone(&chrono::Utc).timestamp()
+                        }),
+                ),
+                source: RepoSource::Github {
+                    url: github_repo_url(&github.username, &name),
+                    token: github.token.clone(),
+                    s3_path_prefix: github.s3_path_prefix.clone(),
+                },
+                remote_state: None,
+                archived_state: None,
+            }
         })
         .collect())
+}
+
+async fn get_all_ssh_repos(object_store: &Operator) -> anyhow::Result<Vec<Repo>> {
+    let Some(ssh_config) = CONFIG.ssh.as_ref() else {
+        return Ok(Vec::new());
+    };
+
+    let directories = ssh::list_remote_directories(ssh_config).await?;
+    let archive_dates =
+        get_all_repo_archive_dates(object_store, &ssh_config.s3_path_prefix).await?;
+    let archived_states = get_all_repo_states(object_store, &ssh_config.s3_path_prefix).await?;
+    let mut repos = Vec::new();
+
+    for name in directories {
+        let url = ssh::git_remote_url(ssh_config, &name);
+        let Some(remote_state) = probe_ssh_repository(ssh_config, &name, &url).await? else {
+            continue;
+        };
+
+        repos.push(Repo {
+            name: name.clone(),
+            updated_at: None,
+            archive_date: archive_dates.get(&name).copied().flatten(),
+            source: RepoSource::Ssh {
+                url,
+                private_key_path: ssh_config.private_key_path.clone(),
+                s3_path_prefix: ssh_config.s3_path_prefix.clone(),
+            },
+            archived_state: archived_states.get(&name).cloned(),
+            remote_state: Some(remote_state),
+        });
+    }
+
+    debug!(
+        "Discovered {} SSH repositories under {}",
+        repos.len(),
+        ssh_config.root_dir
+    );
+    Ok(repos)
+}
+
+async fn probe_ssh_repository(
+    config: &SshConfig,
+    name: &str,
+    url: &str,
+) -> anyhow::Result<Option<String>> {
+    let mut command = tokio::process::Command::new("git");
+    ssh::configure_git_ssh(&mut command, &config.private_key_path);
+    let output = command.arg("ls-remote").arg("--").arg(url).output().await?;
+    if output.status.success() {
+        return Ok(Some(ssh::canonical_remote_ref_state(&output.stdout)));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if is_non_repository_probe_error(&stderr) {
+        debug!("Skipping non-Git SSH directory {}: {}", name, stderr.trim());
+        return Ok(None);
+    }
+
+    anyhow::bail!(
+        "Failed to inspect SSH repository {}: {}",
+        name,
+        stderr.trim()
+    )
 }
 
 async fn get_all_repo_archive_dates(
@@ -154,13 +294,46 @@ async fn get_all_repo_archive_dates(
     Ok(archive_dates)
 }
 
-pub async fn clone_repo(repo: &Repo) -> anyhow::Result<()> {
-    // make sure work_dir/clone exists
-    let clone_dir = std::path::Path::new(&CONFIG.work_dir).join("clone");
+async fn get_all_repo_states(
+    object_store: &Operator,
+    s3_path_prefix: &str,
+) -> anyhow::Result<HashMap<String, String>> {
+    let mut states = HashMap::new();
+    let mut lister = object_store.lister(s3_path_prefix).await?;
+    while let Some(object) = lister.next().await {
+        let object = match object {
+            Ok(obj) => obj,
+            Err(error) => {
+                error!("Failed to list SSH state object: {}", error);
+                continue;
+            }
+        };
+        let key = object.name();
+        let Some(name) = state_repo_name_from_object_key(key) else {
+            continue;
+        };
+        let state_key = source_object_key(s3_path_prefix, name, SSH_STATE_SUFFIX);
+        match object_store.read(&state_key).await {
+            Ok(state) => {
+                states.insert(
+                    name.to_string(),
+                    String::from_utf8_lossy(state.to_vec().as_ref())
+                        .trim()
+                        .to_string(),
+                );
+            }
+            Err(error) => {
+                error!("Failed to read SSH state object {}: {}", state_key, error);
+            }
+        }
+    }
+    Ok(states)
+}
+
+pub async fn clone_repo(repo: &Repo) -> anyhow::Result<Option<String>> {
+    let clone_dir = clone_dir_for(repo);
     tokio::fs::create_dir_all(&clone_dir).await?;
 
-    // test if work_dir/clone/name.git already exists,
-    // if exists,`git -C "work_dir/clone/name.git" remote update`
     let repo_dir = clone_dir.join(format!("{}.git", repo.name));
     if repo_dir.exists() {
         debug!("Repo {} already exists, updating remote", repo.name);
@@ -181,17 +354,13 @@ pub async fn clone_repo(repo: &Repo) -> anyhow::Result<()> {
             );
         }
 
-        let mut command = tokio::process::Command::new("git");
-        let github = CONFIG
-            .github
-            .as_ref()
-            .expect("GitHub configuration is required for GitHub repositories");
-        configure_git_auth(&mut command, &github.token);
+        let mut command = authenticated_git_command(repo);
         let output = command
             .arg("-C")
             .arg(&repo_dir)
             .arg("remote")
             .arg("update")
+            .arg("--prune")
             .output()
             .await?;
         if !output.status.success() {
@@ -202,18 +371,12 @@ pub async fn clone_repo(repo: &Repo) -> anyhow::Result<()> {
             );
         }
     } else {
-        // use tokio::Command to run git clone --mirror repo.url
-        let mut command = tokio::process::Command::new("git");
-        let github = CONFIG
-            .github
-            .as_ref()
-            .expect("GitHub configuration is required for GitHub repositories");
-        configure_git_auth(&mut command, &github.token);
+        let mut command = authenticated_git_command(repo);
         let output = command
             .arg("clone")
             .arg("--mirror")
             .arg(repo.url())
-            .current_dir(clone_dir)
+            .arg(&repo_dir)
             .output()
             .await?;
         if !output.status.success() {
@@ -259,12 +422,18 @@ pub async fn clone_repo(repo: &Repo) -> anyhow::Result<()> {
         );
     }
 
-    Ok(())
+    let remote_state = if repo.is_ssh() {
+        Some(local_remote_ref_state(&repo_dir).await?)
+    } else {
+        None
+    };
+
+    Ok(remote_state)
 }
 
 pub async fn archive_repo(repo: &Repo) -> anyhow::Result<()> {
-    let archive_dir = std::path::Path::new(&CONFIG.work_dir).join("archive");
-    let clone_dir = std::path::Path::new(&CONFIG.work_dir).join("clone");
+    let archive_dir = archive_dir_for(repo);
+    let clone_dir = clone_dir_for(repo);
 
     let gpg_key_files = configured_gpg_key_files()?;
     archive_repo_at(
@@ -285,27 +454,113 @@ pub async fn archive_repo(repo: &Repo) -> anyhow::Result<()> {
 
 pub async fn upload_archive(object_store: &Operator, repo: &Repo) -> anyhow::Result<()> {
     let archive_suffix = current_archive_suffix();
-    let archive_path = std::path::Path::new(&CONFIG.work_dir)
+    let archive_path = archive_dir_for(repo).join(format!("{}{}", repo.name, archive_suffix));
+    let archive_upload_path = archive_object_key_with_suffix(repo, archive_suffix);
+    upload_muiltipart(object_store, &archive_path, &archive_upload_path).await
+}
+
+pub async fn upload_state(object_store: &Operator, repo: &Repo, state: &str) -> anyhow::Result<()> {
+    if !repo.is_ssh() {
+        return Ok(());
+    }
+
+    object_store
+        .write(
+            &source_object_key(repo.s3_path_prefix(), &repo.name, SSH_STATE_SUFFIX),
+            state.as_bytes().to_vec(),
+        )
+        .await?;
+    Ok(())
+}
+
+fn authenticated_git_command(repo: &Repo) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("git");
+    match &repo.source {
+        RepoSource::Github { token, .. } => configure_git_auth(&mut command, token),
+        RepoSource::Ssh {
+            private_key_path, ..
+        } => ssh::configure_git_ssh(&mut command, private_key_path),
+    }
+    command
+}
+
+async fn local_remote_ref_state(repo_dir: &Path) -> anyhow::Result<String> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .arg("for-each-ref")
+        .arg("--format=%(objectname)\t%(refname)")
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to read synchronized refs from {}: {}",
+            repo_dir.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(ssh::canonical_remote_ref_state(&output.stdout))
+}
+
+fn clone_dir_for(repo: &Repo) -> PathBuf {
+    Path::new(&CONFIG.work_dir)
+        .join("clone")
+        .join(repo.namespace())
+}
+
+fn archive_dir_for(repo: &Repo) -> PathBuf {
+    Path::new(&CONFIG.work_dir)
         .join("archive")
-        .join(format!("{}{}", repo.name, archive_suffix));
-    let github = CONFIG
-        .github
-        .as_ref()
-        .expect("GitHub configuration is required for GitHub repositories");
-    let archive_upload_path = &format!(
-        "{}/{}{}",
-        github.s3_path_prefix.trim_matches('/'),
-        repo.name,
-        archive_suffix
-    );
-    upload_muiltipart(object_store, &archive_path, archive_upload_path).await
+        .join(repo.namespace())
+}
+
+#[cfg(test)]
+fn clone_path_for(repo: &Repo) -> PathBuf {
+    PathBuf::from(repo.namespace()).join(format!("{}.git", repo.name))
+}
+
+#[cfg(test)]
+fn archive_path_for(repo: &Repo) -> PathBuf {
+    PathBuf::from(repo.namespace()).join(format!("{}{}", repo.name, ARCHIVE_SUFFIX))
+}
+
+#[cfg(test)]
+fn archive_object_key(repo: &Repo) -> String {
+    archive_object_key_with_suffix(repo, ARCHIVE_SUFFIX)
+}
+
+fn archive_object_key_with_suffix(repo: &Repo, suffix: &str) -> String {
+    source_object_key(repo.s3_path_prefix(), &repo.name, suffix)
+}
+
+fn source_object_key(prefix: &str, repo_name: &str, suffix: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        format!("{repo_name}{suffix}")
+    } else {
+        format!("{prefix}/{repo_name}{suffix}")
+    }
 }
 
 fn archive_repo_name_from_object_key(key: &str) -> Option<&str> {
-    let key = key.trim_matches('/');
+    let key = key.trim_matches('/').rsplit('/').next()?;
     key.strip_suffix(GPG_ARCHIVE_SUFFIX)
         .or_else(|| key.strip_suffix(ARCHIVE_SUFFIX))
         .or_else(|| key.strip_suffix(LEGACY_ARCHIVE_SUFFIX))
+}
+
+fn state_repo_name_from_object_key(key: &str) -> Option<&str> {
+    key.trim_matches('/')
+        .rsplit('/')
+        .next()?
+        .strip_suffix(SSH_STATE_SUFFIX)
+}
+
+fn is_non_repository_probe_error(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("does not appear to be a git repository")
+        || stderr.contains("not a git repository")
+        || stderr.contains("repository not found")
 }
 
 fn current_archive_suffix() -> &'static str {
@@ -538,6 +793,86 @@ mod tests {
 
         assert_eq!(url, "https://github.com/example-user/example.git");
         assert!(!url.contains('@'));
+    }
+
+    fn test_github_repo(name: &str, s3_path_prefix: &str) -> Repo {
+        Repo {
+            name: name.to_string(),
+            updated_at: Some(100),
+            archive_date: None,
+            source: RepoSource::Github {
+                url: github_repo_url("example-user", name),
+                token: "synthetic-token".into(),
+                s3_path_prefix: s3_path_prefix.into(),
+            },
+            remote_state: None,
+            archived_state: None,
+        }
+    }
+
+    fn test_ssh_repo(name: &str, s3_path_prefix: &str) -> Repo {
+        Repo {
+            name: name.to_string(),
+            updated_at: None,
+            archive_date: None,
+            source: RepoSource::Ssh {
+                url: format!("backup@git.example.test:/srv/git/{name}"),
+                private_key_path: "/run/secrets/id_ed25519".into(),
+                s3_path_prefix: s3_path_prefix.into(),
+            },
+            remote_state: None,
+            archived_state: None,
+        }
+    }
+
+    #[test]
+    fn same_name_sources_have_distinct_local_paths_and_prefixes() {
+        let github = test_github_repo("project", "github/");
+        let ssh = test_ssh_repo("project", "ssh/");
+
+        assert_ne!(clone_path_for(&github), clone_path_for(&ssh));
+        assert_ne!(archive_path_for(&github), archive_path_for(&ssh));
+        assert_eq!(archive_object_key(&github), "github/project.7z");
+        assert_eq!(archive_object_key(&ssh), "ssh/project.7z");
+    }
+
+    #[test]
+    fn archive_repo_name_accepts_legacy_and_current_suffixes_under_a_prefix() {
+        assert_eq!(
+            archive_repo_name_from_object_key("ssh/project.tar.zst"),
+            Some("project")
+        );
+        assert_eq!(
+            archive_repo_name_from_object_key("ssh/project.7z.gpg"),
+            Some("project")
+        );
+        assert_eq!(archive_repo_name_from_object_key("ssh/project.zip"), None);
+    }
+
+    #[test]
+    fn non_repository_probe_is_skipped() {
+        assert!(is_non_repository_probe_error(
+            "fatal: '/srv/git/notes' does not appear to be a git repository"
+        ));
+    }
+
+    #[test]
+    fn unexpected_ssh_probe_failure_is_returned() {
+        assert!(!is_non_repository_probe_error(
+            "Permission denied (publickey)."
+        ));
+    }
+
+    #[test]
+    fn ssh_backup_decision_uses_ref_state_and_legacy_archive() {
+        let mut repo = test_ssh_repo("project", "ssh/");
+        repo.archive_date = Some(100);
+        repo.remote_state = Some("new-state".into());
+        repo.archived_state = Some("new-state".into());
+        assert!(!repo.needs_backup());
+
+        repo.remote_state = Some("changed-state".into());
+        assert!(repo.needs_backup());
     }
 
     #[test]
