@@ -55,3 +55,5 @@ gpg --output repository.7z --decrypt repository.7z.gpg
 When `BACKUP_PASSWORD` was configured, `7zz` prompts for it during extraction. With multiple configured public keys, any one of the corresponding private keys can decrypt the GPG layer.
 
 Existing `.tar.zst`, `.7z`, and `.7z.gpg` objects remain recognized. They are reused until the corresponding GitHub repository changes, at which point a new archive using the current configuration is uploaded.
+
+The job continues processing other repositories after an individual clone, archive, or upload failure, but exits with a non-zero status after the run if any repository failed so container schedulers can mark the job as failed.

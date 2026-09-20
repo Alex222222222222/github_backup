@@ -390,6 +390,26 @@ async fn archive_repo_at(
     Ok(())
 }
 
+fn gpg_home_for_archive(archive_path: &std::path::Path) -> PathBuf {
+    archive_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(".gpg-home")
+}
+
+async fn ensure_gpg_home(gpg_home: &std::path::Path) -> anyhow::Result<()> {
+    tokio::fs::create_dir_all(gpg_home).await?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        tokio::fs::set_permissions(gpg_home, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+
+    Ok(())
+}
+
 async fn encrypt_archive_with_gpg(
     archive_path: &std::path::Path,
     key_files: &[PathBuf],
@@ -399,6 +419,11 @@ async fn encrypt_archive_with_gpg(
     }
 
     let archive_path = absolute_path(archive_path)?;
+    let gpg_home = gpg_home_for_archive(&archive_path);
+    if let Err(error) = ensure_gpg_home(&gpg_home).await {
+        let _ = tokio::fs::remove_file(&archive_path).await;
+        return Err(error);
+    }
     let encrypted_archive_path = archive_path.with_file_name(format!(
         "{}{}",
         archive_path
@@ -414,6 +439,8 @@ async fn encrypt_archive_with_gpg(
     let mut command = tokio::process::Command::new("gpg");
     command
         .arg("--no-options")
+        .arg("--homedir")
+        .arg(&gpg_home)
         .arg("--no-default-keyring")
         .arg("--batch")
         .arg("--yes")
@@ -580,6 +607,16 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn gpg_home_is_kept_next_to_the_archive() {
+        let archive_path = std::path::Path::new("/work/archive/example.7z");
+
+        assert_eq!(
+            gpg_home_for_archive(archive_path),
+            PathBuf::from("/work/archive/.gpg-home")
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires the 7zz runtime dependency"]
     async fn archive_repo_at_creates_a_password_protected_archive() {
@@ -739,6 +776,7 @@ mod tests {
 
         assert!(encrypted_archive.exists());
         assert!(!archive.exists());
+        assert!(archive_dir.join(".gpg-home").is_dir());
 
         for (home, output_path) in [
             (&first_home, root.join("first-decrypted.7z")),
