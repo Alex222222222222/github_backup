@@ -14,6 +14,7 @@ pub struct SshConfig {
     pub username: String,
     pub host: String,
     pub port: u16,
+    pub disable_host_key_check: bool,
     pub private_key_path: PathBuf,
     pub root_dir: String,
     pub s3_path_prefix: String,
@@ -66,6 +67,7 @@ impl Config {
         let ssh_root_dir = non_empty_env(&mut get, "SSH_ROOT_DIR");
         let ssh_s3_path_prefix = non_empty_env(&mut get, "SSH_S3_PATH_PREFIX");
         let ssh_port = non_empty_env(&mut get, "SSH_PORT");
+        let ssh_disable_host_key_check = non_empty_env(&mut get, "SSH_DISABLE_HOST_KEY_CHECK");
         let ssh_values = [
             ("SSH_USERNAME", ssh_username.is_some()),
             ("SSH_HOST", ssh_host.is_some()),
@@ -89,6 +91,9 @@ impl Config {
                 username: ssh_username.expect("validated SSH_USERNAME"),
                 host: ssh_host.expect("validated SSH_HOST"),
                 port: parse_ssh_port(ssh_port.as_deref())?,
+                disable_host_key_check: parse_ssh_disable_host_key_check(
+                    ssh_disable_host_key_check.as_deref(),
+                )?,
                 private_key_path: PathBuf::from(
                     ssh_private_key_path.expect("validated SSH_PRIVATE_KEY_PATH"),
                 ),
@@ -144,6 +149,16 @@ fn parse_ssh_port(value: Option<&str>) -> anyhow::Result<u16> {
         anyhow::bail!("SSH_PORT must be an integer between 1 and 65535");
     }
     Ok(port)
+}
+
+fn parse_ssh_disable_host_key_check(value: Option<&str>) -> anyhow::Result<bool> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+
+    value
+        .parse::<bool>()
+        .map_err(|_| anyhow::anyhow!("SSH_DISABLE_HOST_KEY_CHECK must be either true or false"))
 }
 
 fn non_empty_env<F>(get: &mut F, name: &str) -> Option<String>
@@ -311,5 +326,45 @@ mod tests {
         };
 
         assert!(error.to_string().contains("SSH_PORT"));
+    }
+
+    #[test]
+    fn ssh_host_key_check_is_enabled_by_default() {
+        let config = Config::from_env_with(ssh_environment()).unwrap();
+
+        assert!(!config.ssh.unwrap().disable_host_key_check);
+    }
+
+    #[test]
+    fn ssh_host_key_check_can_be_disabled() {
+        let mut environment = base_environment();
+        environment.insert("SSH_USERNAME".into(), "backup".into());
+        environment.insert("SSH_HOST".into(), "git.example.test".into());
+        environment.insert("SSH_PRIVATE_KEY_PATH".into(), "/run/secrets/key".into());
+        environment.insert("SSH_ROOT_DIR".into(), "/srv/git".into());
+        environment.insert("SSH_S3_PATH_PREFIX".into(), "ssh/".into());
+        environment.insert("SSH_DISABLE_HOST_KEY_CHECK".into(), "true".into());
+
+        let config = Config::from_env_with(|name| environment.get(name).cloned()).unwrap();
+
+        assert!(config.ssh.unwrap().disable_host_key_check);
+    }
+
+    #[test]
+    fn invalid_ssh_host_key_check_setting_is_rejected() {
+        let mut environment = base_environment();
+        environment.insert("SSH_USERNAME".into(), "backup".into());
+        environment.insert("SSH_HOST".into(), "git.example.test".into());
+        environment.insert("SSH_PRIVATE_KEY_PATH".into(), "/run/secrets/key".into());
+        environment.insert("SSH_ROOT_DIR".into(), "/srv/git".into());
+        environment.insert("SSH_S3_PATH_PREFIX".into(), "ssh/".into());
+        environment.insert("SSH_DISABLE_HOST_KEY_CHECK".into(), "yes".into());
+
+        let error = match Config::from_env_with(|name| environment.get(name).cloned()) {
+            Ok(_) => panic!("invalid SSH host-key setting should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("SSH_DISABLE_HOST_KEY_CHECK"));
     }
 }

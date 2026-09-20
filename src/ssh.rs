@@ -1,6 +1,7 @@
 use std::{path::Path, sync::Arc};
 
 use anyhow::Context;
+use log::warn;
 use russh::{
     Disconnect, client, keys,
     keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate},
@@ -15,6 +16,11 @@ pub async fn list_remote_directories(config: &SshConfig) -> anyhow::Result<Vec<S
     let port = config.port;
     let private_key_path = config.private_key_path.clone();
     let root_dir = config.root_dir.clone();
+    let disable_host_key_check = config.disable_host_key_check;
+
+    if disable_host_key_check {
+        warn!("SSH host-key verification is disabled for host {host}");
+    }
 
     let mut session = client::connect(
         Arc::new(client::Config::default()),
@@ -22,6 +28,7 @@ pub async fn list_remote_directories(config: &SshConfig) -> anyhow::Result<Vec<S
         KnownHostsHandler {
             host: host.clone(),
             port,
+            disable_host_key_check,
         },
     )
     .await
@@ -91,13 +98,19 @@ pub fn configure_git_ssh(
     command: &mut tokio::process::Command,
     private_key_path: &Path,
     port: u16,
+    disable_host_key_check: bool,
 ) {
+    let host_key_options = if disable_host_key_check {
+        " -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    } else {
+        ""
+    };
     command
         .env(
             "GIT_SSH_COMMAND",
             format!(
-                "ssh -p {port} -i {} -o IdentitiesOnly=yes -o BatchMode=yes",
-                shell_quote(private_key_path)
+                "ssh -p {port} -i {} -o IdentitiesOnly=yes -o BatchMode=yes{host_key_options}",
+                shell_quote(private_key_path),
             ),
         )
         .env("GIT_TERMINAL_PROMPT", "0");
@@ -122,6 +135,7 @@ fn shell_quote(path: &Path) -> String {
 struct KnownHostsHandler {
     host: String,
     port: u16,
+    disable_host_key_check: bool,
 }
 
 impl client::Handler for KnownHostsHandler {
@@ -131,6 +145,10 @@ impl client::Handler for KnownHostsHandler {
         &mut self,
         server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
+        if self.disable_host_key_check {
+            return Ok(true);
+        }
+
         let known = keys::check_known_hosts(&self.host, self.port, &server_public_key.public_key())
             .with_context(|| format!("failed to read SSH known_hosts for {}", self.host))?;
         if !known {
@@ -147,6 +165,7 @@ impl client::Handler for KnownHostsHandler {
 mod tests {
     use super::*;
     use crate::config::SshConfig;
+    use russh::client::Handler;
     use std::path::{Path, PathBuf};
 
     fn test_ssh_config(private_key_path: PathBuf) -> SshConfig {
@@ -157,6 +176,7 @@ mod tests {
             root_dir: "/srv/git".into(),
             s3_path_prefix: "ssh/".into(),
             port: 2222,
+            disable_host_key_check: false,
         }
     }
 
@@ -184,6 +204,7 @@ mod tests {
             &mut command,
             Path::new("/run/secrets/key with 'quote'"),
             2222,
+            false,
         );
 
         let value = command
@@ -202,7 +223,12 @@ mod tests {
     #[test]
     fn ssh_git_command_includes_configured_port() {
         let mut command = tokio::process::Command::new("git");
-        configure_git_ssh(&mut command, Path::new("/run/secrets/id_ed25519"), 2222);
+        configure_git_ssh(
+            &mut command,
+            Path::new("/run/secrets/id_ed25519"),
+            2222,
+            false,
+        );
 
         let value = command
             .as_std()
@@ -213,6 +239,45 @@ mod tests {
             .to_string_lossy();
 
         assert!(value.contains("-p 2222"));
+    }
+
+    #[test]
+    fn ssh_git_command_disables_host_key_checks_when_requested() {
+        let mut command = tokio::process::Command::new("git");
+        configure_git_ssh(
+            &mut command,
+            Path::new("/run/secrets/id_ed25519"),
+            2222,
+            true,
+        );
+
+        let value = command
+            .as_std()
+            .get_envs()
+            .find(|(name, _)| *name == "GIT_SSH_COMMAND")
+            .and_then(|(_, value)| value)
+            .unwrap()
+            .to_string_lossy();
+
+        assert!(value.contains("StrictHostKeyChecking=no"));
+        assert!(value.contains("UserKnownHostsFile=/dev/null"));
+    }
+
+    #[tokio::test]
+    async fn disabled_host_key_check_accepts_an_unlisted_key() {
+        let mut handler = KnownHostsHandler {
+            host: "host-not-in-known-hosts".into(),
+            port: 2222,
+            disable_host_key_check: true,
+        };
+        let public_key = PublicKeyOrCertificate::from(
+            keys::parse_public_key_base64(
+                "AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ",
+            )
+            .unwrap(),
+        );
+
+        assert!(handler.check_server_key(&public_key).await.unwrap());
     }
 
     #[test]

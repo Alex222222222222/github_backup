@@ -89,6 +89,7 @@ mod tests {
             source: RepoSource::Ssh {
                 url: format!("backup@git.example.test:/srv/git/{name}"),
                 port: 2222,
+                disable_host_key_check: false,
                 private_key_path: PathBuf::from("/run/secrets/id_ed25519"),
                 s3_path_prefix: "ssh/".into(),
             },

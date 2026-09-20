@@ -21,6 +21,7 @@ Configure these required variables to enable the SSH source:
 - `SSH_USERNAME`: SSH login username.
 - `SSH_HOST`: SSH host name or address.
 - `SSH_PORT`: optional SSH port; defaults to `22`.
+- `SSH_DISABLE_HOST_KEY_CHECK`: optional boolean; defaults to `false`. Set to `true` only when host-key verification cannot be provisioned; this disables verification for both SFTP and Git-over-SSH.
 - `SSH_PRIVATE_KEY_PATH`: path inside the container to a private key usable without an interactive passphrase prompt.
 - `SSH_ROOT_DIR`: remote directory whose immediate child directories are inspected.
 - `SSH_S3_PATH_PREFIX`: separate S3 prefix for SSH archives, for example `ssh/`.
@@ -28,6 +29,8 @@ Configure these required variables to enable the SSH source:
 The program uses the SSH connection's SFTP subsystem to list directories; it does not run arbitrary shell commands for discovery. Each child directory is then checked with `git ls-remote` and synchronized with `git clone --mirror` or `git remote update --prune` over Git's SSH transport. The SSH server therefore needs normal Git-over-SSH support for those repository paths and an SFTP subsystem, but does not need to provide a general-purpose interactive shell.
 
 SSH connections use `SSH_PORT` for both SFTP and Git-over-SSH; the default is `22`. SSH host keys are verified against the app user's standard `/home/app/.ssh/known_hosts` file in the container. Mount a prepared `known_hosts` file at that path. For a non-default port, the entry normally uses the `[host]:port` form. Unknown or changed host keys cause the backup to fail rather than being accepted automatically. Git uses the same host-key policy through OpenSSH.
+
+When `SSH_DISABLE_HOST_KEY_CHECK=true`, the application accepts any SSH host key and Git uses no persistent known-hosts file. This is insecure and makes man-in-the-middle attacks possible; leave it unset or `false` whenever a trusted `known_hosts` file can be mounted.
 
 The SSH source lists only immediate directories under `SSH_ROOT_DIR`. Non-Git directories are skipped. Valid repositories are stored under `SSH_S3_PATH_PREFIX`; a small `<repository>.state` object records the synchronized Git refs so unchanged SSH repositories are not re-uploaded on later runs.
 

@@ -30,6 +30,7 @@ pub enum RepoSource {
     Ssh {
         url: String,
         port: u16,
+        disable_host_key_check: bool,
         private_key_path: PathBuf,
         s3_path_prefix: String,
     },
@@ -225,6 +226,7 @@ async fn get_all_ssh_repos(object_store: &Operator) -> anyhow::Result<Vec<Repo>>
             source: RepoSource::Ssh {
                 url,
                 port: ssh_config.port,
+                disable_host_key_check: ssh_config.disable_host_key_check,
                 private_key_path: ssh_config.private_key_path.clone(),
                 s3_path_prefix: ssh_config.s3_path_prefix.clone(),
             },
@@ -247,7 +249,12 @@ async fn probe_ssh_repository(
     url: &str,
 ) -> anyhow::Result<Option<String>> {
     let mut command = tokio::process::Command::new("git");
-    ssh::configure_git_ssh(&mut command, &config.private_key_path, config.port);
+    ssh::configure_git_ssh(
+        &mut command,
+        &config.private_key_path,
+        config.port,
+        config.disable_host_key_check,
+    );
     let output = command.arg("ls-remote").arg("--").arg(url).output().await?;
     if output.status.success() {
         return Ok(Some(ssh::canonical_remote_ref_state(&output.stdout)));
@@ -481,9 +488,15 @@ fn authenticated_git_command(repo: &Repo) -> tokio::process::Command {
         RepoSource::Github { token, .. } => configure_git_auth(&mut command, token),
         RepoSource::Ssh {
             port,
+            disable_host_key_check,
             private_key_path,
             ..
-        } => ssh::configure_git_ssh(&mut command, private_key_path, *port),
+        } => ssh::configure_git_ssh(
+            &mut command,
+            private_key_path,
+            *port,
+            *disable_host_key_check,
+        ),
     }
     command
 }
@@ -822,6 +835,7 @@ mod tests {
             source: RepoSource::Ssh {
                 url: format!("backup@git.example.test:/srv/git/{name}"),
                 port: 2222,
+                disable_host_key_check: false,
                 private_key_path: "/run/secrets/id_ed25519".into(),
                 s3_path_prefix: s3_path_prefix.into(),
             },
