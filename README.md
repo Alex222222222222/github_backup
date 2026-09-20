@@ -5,6 +5,7 @@ A rust script to backup all repositories of a GitHub user.
 Enviroment variables:
 - `GITHUB_USERNAME`: The GitHub username to backup.
 - `GITHUB_TOKEN`: The GitHub personal access token with `repo` scope to access the repositories.
+- `BACKUP_PASSWORD`: Optional password for new `.7z` backup archives. If empty or unset, archives are not encrypted.
 - `WORK_DIR`: The directory for temporary files and logs. Default is `./backup`.
 - `PER_PAGE`: The number of repositories to fetch from GitHub api per page. Default is `100`.
 - `RUST_LOG`: The log level for the script. Default is `info`.
@@ -25,6 +26,7 @@ Through docker:
 docker run --rm \
   -e GITHUB_USERNAME=your_github_username \
   -e GITHUB_TOKEN=your_github_token \
+  -e BACKUP_PASSWORD=your_backup_password \
   -e S3_ENDPOINT=your_s3_endpoint \
   -e S3_ACCESS_KEY_ID=your_s3_access_key_id \
   -e S3_ACCESS_KEY=your_s3_access_key \
@@ -39,3 +41,11 @@ docker run --rm \
 ```bash
 docker build -t github-backup:local .
 ```
+
+New backups are stored as `.7z` files. If `BACKUP_PASSWORD` is non-empty, they are password-protected. Extract one manually with:
+
+```bash
+7zz x repository.7z
+```
+
+Existing `.tar.zst` objects remain recognized. They are reused until the corresponding GitHub repository changes, at which point a new `.7z` archive is uploaded.

@@ -8,6 +8,8 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 use crate::config::CONFIG;
 
 const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+const ARCHIVE_SUFFIX: &str = ".7z";
+const LEGACY_ARCHIVE_SUFFIX: &str = ".tar.zst";
 
 pub struct Repo {
     pub name: String,
@@ -105,7 +107,7 @@ pub async fn get_all_repos(object_store: &Operator) -> anyhow::Result<Vec<Repo>>
 async fn get_all_repo_archive_dates(
     object_store: &Operator,
 ) -> anyhow::Result<HashMap<String, Option<i64>>> {
-    // list all archived repos in s3_object_store/prefix, the name is repo_name.tar.zst
+    // list all archived repos in the S3 prefix; names may use the current or legacy suffix
     let mut archive_dates = HashMap::new();
     let mut lister = object_store.lister(&CONFIG.s3_path_prefix).await?;
     while let Some(object) = lister.next().await {
@@ -117,9 +119,10 @@ async fn get_all_repo_archive_dates(
             }
         };
         let key = object.name();
-        if let Some(repo_name) = key.trim_matches('/').strip_suffix(".tar.zst") {
-            archive_dates.insert(
-                repo_name.to_string(),
+        if let Some(repo_name) = archive_repo_name_from_object_key(key) {
+            record_archive_date(
+                &mut archive_dates,
+                repo_name,
                 object
                     .metadata()
                     .last_modified()
@@ -210,41 +213,104 @@ pub async fn clone_repo(repo: &Repo) -> anyhow::Result<()> {
 }
 
 pub async fn archive_repo(repo: &Repo) -> anyhow::Result<()> {
-    // tar --zstd -cf "work_dir/archive/$name.tar.zst" -C "work_dir/clone" "name.git"
-    // make sure work_dir/archive exists
     let archive_dir = std::path::Path::new(&CONFIG.work_dir).join("archive");
-    tokio::fs::create_dir_all(&archive_dir).await?;
-    let output = tokio::process::Command::new("tar")
-        .arg("--zstd")
-        .arg("-cf")
-        .arg(archive_dir.join(format!("{}.tar.zst", repo.name)))
-        .arg("-C")
-        .arg(std::path::Path::new(&CONFIG.work_dir).join("clone"))
-        .arg(format!("{}.git", repo.name))
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "Failed to archive repo {}: {}",
-            repo.name,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    Ok(())
+    let clone_dir = std::path::Path::new(&CONFIG.work_dir).join("clone");
+    archive_repo_at(
+        &archive_dir,
+        &clone_dir,
+        &repo.name,
+        &CONFIG.backup_password,
+    )
+    .await
 }
 
 pub async fn upload_archive(object_store: &Operator, repo: &Repo) -> anyhow::Result<()> {
     let archive_path = std::path::Path::new(&CONFIG.work_dir)
         .join("archive")
-        .join(format!("{}.tar.zst", repo.name));
+        .join(format!("{}{}", repo.name, ARCHIVE_SUFFIX));
     let archive_upload_path = &format!(
-        "{}/{}.tar.zst",
+        "{}/{}{}",
         CONFIG.s3_path_prefix.trim_matches('/'),
-        repo.name
+        repo.name,
+        ARCHIVE_SUFFIX
     );
     upload_muiltipart(object_store, &archive_path, archive_upload_path).await
+}
+
+fn archive_repo_name_from_object_key(key: &str) -> Option<&str> {
+    let key = key.trim_matches('/');
+    key.strip_suffix(ARCHIVE_SUFFIX)
+        .or_else(|| key.strip_suffix(LEGACY_ARCHIVE_SUFFIX))
+}
+
+fn record_archive_date(
+    archive_dates: &mut HashMap<String, Option<i64>>,
+    repo_name: &str,
+    archive_date: Option<i64>,
+) {
+    archive_dates
+        .entry(repo_name.to_string())
+        .and_modify(|current| {
+            if archive_date > *current {
+                *current = archive_date;
+            }
+        })
+        .or_insert(archive_date);
+}
+
+async fn archive_repo_at(
+    archive_dir: &std::path::Path,
+    clone_dir: &std::path::Path,
+    repo_name: &str,
+    password: &str,
+) -> anyhow::Result<()> {
+    tokio::fs::create_dir_all(archive_dir).await?;
+
+    let archive_path =
+        absolute_path(&archive_dir.join(format!("{}{}", repo_name, ARCHIVE_SUFFIX)))?;
+    let temporary_archive_path =
+        absolute_path(&archive_dir.join(format!("{}{}.part", repo_name, ARCHIVE_SUFFIX)))?;
+    let clone_dir = absolute_path(clone_dir)?;
+    let _ = tokio::fs::remove_file(&temporary_archive_path).await;
+
+    let mut command = tokio::process::Command::new("7zz");
+    command.arg("a").arg("-t7z").arg("-mx=1").arg("-y");
+    if !password.is_empty() {
+        command.arg("-mhe=on").arg(format!("-p{}", password));
+    }
+    let output = command
+        .arg(&temporary_archive_path)
+        .arg(format!("{}.git", repo_name))
+        .current_dir(&clone_dir)
+        .output()
+        .await;
+
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temporary_archive_path).await;
+            return Err(error.into());
+        }
+    };
+
+    if !output.status.success() {
+        let _ = tokio::fs::remove_file(&temporary_archive_path).await;
+        anyhow::bail!(
+            "Failed to archive repo {}: {}",
+            repo_name,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    tokio::fs::rename(temporary_archive_path, archive_path).await?;
+    Ok(())
+}
+
+fn absolute_path(path: &std::path::Path) -> anyhow::Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(std::env::current_dir()?.join(path))
 }
 
 pub async fn upload_muiltipart(
@@ -263,4 +329,145 @@ pub async fn upload_muiltipart(
     writer.close().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn archive_repo_name_accepts_seven_zip_and_legacy_tar_zstd_objects() {
+        assert_eq!(
+            archive_repo_name_from_object_key("example.7z"),
+            Some("example")
+        );
+        assert_eq!(
+            archive_repo_name_from_object_key("example.tar.zst"),
+            Some("example")
+        );
+    }
+
+    #[test]
+    fn archive_repo_name_ignores_objects_with_unknown_suffixes() {
+        assert_eq!(
+            archive_repo_name_from_object_key("github-backup/example.zip"),
+            None
+        );
+    }
+
+    #[test]
+    fn archive_dates_keep_the_newest_object_when_formats_coexist() {
+        let mut archive_dates = HashMap::new();
+        record_archive_date(&mut archive_dates, "example", Some(10));
+        record_archive_date(&mut archive_dates, "example", Some(20));
+
+        assert_eq!(archive_dates.get("example"), Some(&Some(20)));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the 7zz runtime dependency"]
+    async fn archive_repo_at_creates_a_password_protected_archive() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "github-backup-archive-test-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        let clone_dir = root.join("clone");
+        let archive_dir = root.join("archive");
+        let repo_dir = clone_dir.join("example.git");
+        let archive_path = archive_dir.join("example.7z");
+        let password = "test backup password";
+
+        tokio::fs::create_dir_all(&repo_dir).await.unwrap();
+        tokio::fs::write(repo_dir.join("marker.txt"), "backup test")
+            .await
+            .unwrap();
+
+        archive_repo_at(&archive_dir, &clone_dir, "example", password)
+            .await
+            .unwrap();
+
+        let listing_without_password = tokio::process::Command::new("7zz")
+            .arg("l")
+            .arg(&archive_path)
+            .output()
+            .await
+            .unwrap();
+        let listing_output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&listing_without_password.stdout),
+            String::from_utf8_lossy(&listing_without_password.stderr)
+        );
+        assert!(!listing_output.contains("marker.txt"));
+
+        let wrong_password = tokio::process::Command::new("7zz")
+            .arg("t")
+            .arg("-pwrong password")
+            .arg(&archive_path)
+            .output()
+            .await
+            .unwrap();
+        assert!(!wrong_password.status.success());
+
+        let correct_password = tokio::process::Command::new("7zz")
+            .arg("t")
+            .arg(format!("-p{password}"))
+            .arg(&archive_path)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            correct_password.status.success(),
+            "7zz failed to test archive: {}",
+            String::from_utf8_lossy(&correct_password.stderr)
+        );
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the 7zz runtime dependency"]
+    async fn archive_repo_at_creates_an_unencrypted_archive_for_an_empty_password() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "github-backup-unencrypted-test-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        let clone_dir = root.join("clone");
+        let archive_dir = root.join("archive");
+        let repo_dir = clone_dir.join("example.git");
+        let archive_path = archive_dir.join("example.7z");
+
+        tokio::fs::create_dir_all(&repo_dir).await.unwrap();
+        tokio::fs::write(repo_dir.join("marker.txt"), "backup test")
+            .await
+            .unwrap();
+
+        archive_repo_at(&archive_dir, &clone_dir, "example", "")
+            .await
+            .unwrap();
+
+        let test_output = tokio::process::Command::new("7zz")
+            .arg("t")
+            .arg(&archive_path)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            test_output.status.success(),
+            "7zz failed to test unencrypted archive: {}",
+            String::from_utf8_lossy(&test_output.stderr)
+        );
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
 }
