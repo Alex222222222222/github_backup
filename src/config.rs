@@ -102,6 +102,12 @@ impl Config {
             );
         }
 
+        if let (Some(github), Some(ssh)) = (&github, &ssh)
+            && github.s3_path_prefix.trim_matches('/') == ssh.s3_path_prefix.trim_matches('/')
+        {
+            anyhow::bail!("GitHub and SSH sources require different S3 prefixes");
+        }
+
         Ok(Self {
             github,
             ssh,
@@ -205,6 +211,26 @@ mod tests {
 
         assert_eq!(config.github.unwrap().s3_path_prefix, "github/");
         assert_eq!(config.ssh.unwrap().s3_path_prefix, "ssh/");
+    }
+
+    #[test]
+    fn both_sources_reject_the_same_s3_prefix() {
+        let mut environment = base_environment();
+        environment.insert("GITHUB_USERNAME".into(), "github-user".into());
+        environment.insert("GITHUB_TOKEN".into(), "github-token".into());
+        environment.insert("S3_PATH_PREFIX".into(), "backup/".into());
+        environment.insert("SSH_USERNAME".into(), "backup".into());
+        environment.insert("SSH_HOST".into(), "git.example.test".into());
+        environment.insert("SSH_PRIVATE_KEY_PATH".into(), "/run/secrets/key".into());
+        environment.insert("SSH_ROOT_DIR".into(), "/srv/git".into());
+        environment.insert("SSH_S3_PATH_PREFIX".into(), "backup".into());
+
+        let error = match Config::from_env_with(|name| environment.get(name).cloned()) {
+            Ok(_) => panic!("identical source prefixes should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("different S3 prefixes"));
     }
 
     #[test]

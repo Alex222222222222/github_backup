@@ -1,4 +1,5 @@
+.env
+.env.*
 target
 backup
-.env
-README.md
+.git

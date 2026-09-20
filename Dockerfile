@@ -5,6 +5,7 @@ WORKDIR /app
 # Build deps (musl toolchain bits)
 RUN apk add --no-cache \
   build-base \
+  cmake \
   pkgconfig \
   musl-dev
 
@@ -28,6 +29,7 @@ RUN chown -R app:app /app
 COPY --from=builder /app/target/release/github_backup /usr/local/bin/github_backup
 
 # set `RUST_LOG` to `info` by default, can be overridden by setting the environment variable when running the container
+ENV HOME=/home/app
 ENV RUST_LOG=info
 
 USER app
