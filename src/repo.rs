@@ -1,8 +1,9 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
+use anyhow::Context;
 use futures_util::{AsyncWriteExt, StreamExt};
 use log::{debug, error};
 use opendal::Operator;
@@ -207,15 +208,32 @@ async fn get_all_ssh_repos(object_store: &Operator) -> anyhow::Result<Vec<Repo>>
         return Ok(Vec::new());
     };
 
-    let directories = ssh::list_remote_directories(ssh_config).await?;
+    let explicit_repositories = ssh_config.repositories.is_some();
+    let repository_paths = match ssh_config.repositories.as_ref() {
+        Some(repositories) => repositories.clone(),
+        None => ssh::list_remote_directories(ssh_config).await?,
+    };
     let archive_dates =
         get_all_repo_archive_dates(object_store, &ssh_config.s3_path_prefix).await?;
     let archived_states = get_all_repo_states(object_store, &ssh_config.s3_path_prefix).await?;
     let mut repos = Vec::new();
+    let mut names = HashSet::new();
 
-    for name in directories {
-        let url = ssh::git_remote_url(ssh_config, &name);
+    for repository_path in repository_paths {
+        let name = ssh::repository_name(&repository_path)
+            .with_context(|| format!("invalid SSH repository path {repository_path:?}"))?;
+        if !names.insert(name.clone()) {
+            anyhow::bail!("SSH repository list contains duplicate name {name}");
+        }
+
+        let url = ssh::git_remote_url(ssh_config, &repository_path);
         let Some(remote_state) = probe_ssh_repository(ssh_config, &name, &url).await? else {
+            if explicit_repositories {
+                anyhow::bail!(
+                    "Configured SSH repository {} is not a Git repository",
+                    repository_path
+                );
+            }
             continue;
         };
 

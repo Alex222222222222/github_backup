@@ -15,6 +15,7 @@ pub struct SshConfig {
     pub host: String,
     pub port: u16,
     pub disable_host_key_check: bool,
+    pub repositories: Option<Vec<String>>,
     pub private_key_path: PathBuf,
     pub root_dir: String,
     pub s3_path_prefix: String,
@@ -68,6 +69,7 @@ impl Config {
         let ssh_s3_path_prefix = non_empty_env(&mut get, "SSH_S3_PATH_PREFIX");
         let ssh_port = non_empty_env(&mut get, "SSH_PORT");
         let ssh_disable_host_key_check = non_empty_env(&mut get, "SSH_DISABLE_HOST_KEY_CHECK");
+        let ssh_repositories = non_empty_env(&mut get, "SSH_REPOSITORIES");
         let ssh_values = [
             ("SSH_USERNAME", ssh_username.is_some()),
             ("SSH_HOST", ssh_host.is_some()),
@@ -94,6 +96,7 @@ impl Config {
                 disable_host_key_check: parse_ssh_disable_host_key_check(
                     ssh_disable_host_key_check.as_deref(),
                 )?,
+                repositories: parse_ssh_repositories(ssh_repositories.as_deref())?,
                 private_key_path: PathBuf::from(
                     ssh_private_key_path.expect("validated SSH_PRIVATE_KEY_PATH"),
                 ),
@@ -159,6 +162,20 @@ fn parse_ssh_disable_host_key_check(value: Option<&str>) -> anyhow::Result<bool>
     value
         .parse::<bool>()
         .map_err(|_| anyhow::anyhow!("SSH_DISABLE_HOST_KEY_CHECK must be either true or false"))
+}
+
+fn parse_ssh_repositories(value: Option<&str>) -> anyhow::Result<Option<Vec<String>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let repositories = serde_json::from_str::<Vec<String>>(value).map_err(|error| {
+        anyhow::anyhow!("SSH_REPOSITORIES must be a JSON array of repository paths: {error}")
+    })?;
+    if repositories.is_empty() || repositories.iter().any(String::is_empty) {
+        anyhow::bail!("SSH_REPOSITORIES must contain at least one non-empty path");
+    }
+    Ok(Some(repositories))
 }
 
 fn non_empty_env<F>(get: &mut F, name: &str) -> Option<String>
@@ -366,5 +383,44 @@ mod tests {
         };
 
         assert!(error.to_string().contains("SSH_DISABLE_HOST_KEY_CHECK"));
+    }
+
+    #[test]
+    fn ssh_repository_list_is_parsed_as_json() {
+        let mut environment = base_environment();
+        environment.insert("SSH_USERNAME".into(), "backup".into());
+        environment.insert("SSH_HOST".into(), "git.example.test".into());
+        environment.insert("SSH_PRIVATE_KEY_PATH".into(), "/run/secrets/key".into());
+        environment.insert("SSH_ROOT_DIR".into(), "/srv/git".into());
+        environment.insert("SSH_S3_PATH_PREFIX".into(), "ssh/".into());
+        environment.insert(
+            "SSH_REPOSITORIES".into(),
+            r#"["one.git", "/srv/other/two.git"]"#.into(),
+        );
+
+        let config = Config::from_env_with(|name| environment.get(name).cloned()).unwrap();
+
+        assert_eq!(
+            config.ssh.unwrap().repositories.unwrap(),
+            vec!["one.git", "/srv/other/two.git"]
+        );
+    }
+
+    #[test]
+    fn invalid_ssh_repository_list_is_rejected() {
+        let mut environment = base_environment();
+        environment.insert("SSH_USERNAME".into(), "backup".into());
+        environment.insert("SSH_HOST".into(), "git.example.test".into());
+        environment.insert("SSH_PRIVATE_KEY_PATH".into(), "/run/secrets/key".into());
+        environment.insert("SSH_ROOT_DIR".into(), "/srv/git".into());
+        environment.insert("SSH_S3_PATH_PREFIX".into(), "ssh/".into());
+        environment.insert("SSH_REPOSITORIES".into(), "one.git,two.git".into());
+
+        let error = match Config::from_env_with(|name| environment.get(name).cloned()) {
+            Ok(_) => panic!("invalid SSH repository list should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("SSH_REPOSITORIES"));
     }
 }

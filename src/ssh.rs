@@ -77,12 +77,26 @@ pub async fn list_remote_directories(config: &SshConfig) -> anyhow::Result<Vec<S
 }
 
 pub fn remote_repo_path(root_dir: &str, repo_name: &str) -> String {
+    if repo_name.starts_with('/') {
+        return repo_name.to_owned();
+    }
+
     let root_dir = root_dir.trim_end_matches('/');
     if root_dir.is_empty() {
         format!("/{repo_name}")
     } else {
         format!("{root_dir}/{repo_name}")
     }
+}
+
+pub fn repository_name(repository_path: &str) -> anyhow::Result<String> {
+    let path = repository_path.trim_end_matches('/');
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("SSH repository path has no final name: {repository_path}"))
 }
 
 pub fn git_remote_url(config: &SshConfig, repo_name: &str) -> String {
@@ -177,6 +191,7 @@ mod tests {
             s3_path_prefix: "ssh/".into(),
             port: 2222,
             disable_host_key_check: false,
+            repositories: None,
         }
     }
 
@@ -184,6 +199,23 @@ mod tests {
     fn remote_repo_path_joins_root_and_child_without_duplicate_slashes() {
         assert_eq!(remote_repo_path("/srv/git/", "project"), "/srv/git/project");
         assert_eq!(remote_repo_path("/", "project"), "/project");
+    }
+
+    #[test]
+    fn absolute_repository_path_is_not_joined_to_the_root() {
+        assert_eq!(
+            remote_repo_path("/srv/git", "/srv/other/project.git"),
+            "/srv/other/project.git"
+        );
+    }
+
+    #[test]
+    fn repository_name_uses_the_final_path_component() {
+        assert_eq!(
+            repository_name("/srv/other/project.git").unwrap(),
+            "project.git"
+        );
+        assert_eq!(repository_name("project.git").unwrap(), "project.git");
     }
 
     #[test]
@@ -195,6 +227,15 @@ mod tests {
         assert_eq!(url, "backup@git.example.test:/srv/git/project");
         assert!(!url.contains("id_ed25519"));
         assert_eq!(url.matches('@').count(), 1);
+    }
+
+    #[test]
+    fn git_remote_url_supports_an_absolute_repository_path() {
+        let config = test_ssh_config(PathBuf::from("/run/secrets/id_ed25519"));
+
+        let url = git_remote_url(&config, "/srv/other/project.git");
+
+        assert_eq!(url, "backup@git.example.test:/srv/other/project.git");
     }
 
     #[test]
