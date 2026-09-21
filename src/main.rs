@@ -33,8 +33,8 @@ async fn main() -> anyhow::Result<()> {
         }
 
         info!("Synchronizing repo: {}", repo.name);
-        let synchronized_state = match repo::clone_repo(&repo).await {
-            Ok(state) => state,
+        let synchronized = match repo::clone_repo(&repo).await {
+            Ok(synchronized) => synchronized,
             Err(e) => {
                 error!("Failed to synchronize repo {}: {}", repo.name, e);
                 failed_repositories.push(repo.name.clone());
@@ -42,6 +42,14 @@ async fn main() -> anyhow::Result<()> {
             }
         };
         info!("Synchronized repo: {}", repo.name);
+        if !repo.should_archive_after_sync(synchronized.remote_updated_at) {
+            info!(
+                "Skipping archive for repo {} because no remote Git update is newer than its S3 archive",
+                repo.name
+            );
+            continue;
+        }
+
         info!("Archiving repo: {}", repo.name);
         if let Err(e) = repo::archive_repo(&repo).await {
             error!("Failed to archive repo {}: {}", repo.name, e);
@@ -55,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
             continue;
         }
         info!("Uploaded archive for repo: {}", repo.name);
-        if let Some(state) = synchronized_state
+        if let Some(state) = synchronized.remote_state
             && let Err(e) = repo::upload_state(&object_store, &repo, &state).await
         {
             error!("Failed to upload state of repo {}: {}", repo.name, e);
@@ -103,7 +111,7 @@ mod tests {
     ) -> Repo {
         Repo {
             name: name.into(),
-            updated_at: None,
+            updated_at: Some(90),
             archive_date: Some(100),
             source: RepoSource::Ssh {
                 url: format!("backup@git.example.test:/srv/git/{name}"),

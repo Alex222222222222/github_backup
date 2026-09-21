@@ -45,6 +45,12 @@ pub struct Repo {
     pub remote_state: Option<String>,
     pub archived_state: Option<String>,
 }
+
+pub struct SynchronizationResult {
+    pub remote_state: Option<String>,
+    pub remote_updated_at: Option<i64>,
+}
+
 impl Repo {
     fn url(&self) -> String {
         match &self.source {
@@ -85,9 +91,25 @@ impl Repo {
                 self.archive_date.is_none()
                     || self.remote_state.is_none()
                     || self.remote_state != self.archived_state
+                    || self.updated_at.is_none()
+                    || timestamp_is_newer(self.updated_at, self.archive_date)
             }
         }
     }
+
+    pub fn should_archive_after_sync(&self, remote_updated_at: Option<i64>) -> bool {
+        if !self.is_ssh() {
+            return true;
+        }
+
+        self.archive_date.is_none()
+            || self.remote_state != self.archived_state
+            || timestamp_is_newer(remote_updated_at, self.archive_date)
+    }
+}
+
+fn timestamp_is_newer(updated_at: Option<i64>, archive_date: Option<i64>) -> bool {
+    matches!((updated_at, archive_date), (Some(updated_at), Some(archive_date)) if updated_at > archive_date)
 }
 
 fn github_repo_url(username: &str, repo_name: &str) -> String {
@@ -247,10 +269,11 @@ async fn get_all_ssh_repos(object_store: &Operator) -> anyhow::Result<Vec<Repo>>
             }
             continue;
         };
+        let updated_at = local_remote_updated_at_if_matching(&name, &remote_state).await?;
 
         repos.push(Repo {
             name: name.clone(),
-            updated_at: None,
+            updated_at,
             archive_date: archive_dates.get(&name).copied().flatten(),
             source: RepoSource::Ssh {
                 url,
@@ -284,7 +307,13 @@ async fn probe_ssh_repository(
         config.port,
         config.disable_host_key_check,
     );
-    let output = command.arg("ls-remote").arg("--").arg(url).output().await?;
+    let output = command
+        .arg("ls-remote")
+        .arg("--refs")
+        .arg("--")
+        .arg(url)
+        .output()
+        .await?;
     if output.status.success() {
         return Ok(Some(ssh::canonical_remote_ref_state(&output.stdout)));
     }
@@ -368,11 +397,11 @@ async fn get_all_repo_states(
     Ok(states)
 }
 
-pub async fn clone_repo(repo: &Repo) -> anyhow::Result<Option<String>> {
+pub async fn clone_repo(repo: &Repo) -> anyhow::Result<SynchronizationResult> {
     let clone_dir = clone_dir_for(repo);
     tokio::fs::create_dir_all(&clone_dir).await?;
 
-    let repo_dir = clone_dir.join(format!("{}.git", repo.name));
+    let repo_dir = clone_repo_path_for(repo.namespace(), &repo.name);
     if repo_dir.exists() {
         info!("Updating existing mirror for repo {}", repo.name);
         let output = tokio::process::Command::new("git")
@@ -461,13 +490,19 @@ pub async fn clone_repo(repo: &Repo) -> anyhow::Result<Option<String>> {
         );
     }
 
-    let remote_state = if repo.is_ssh() {
-        Some(local_remote_ref_state(&repo_dir).await?)
+    let (remote_state, remote_updated_at) = if repo.is_ssh() {
+        let metadata = local_repo_metadata(&repo_dir)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("synchronized repository {} is missing", repo.name))?;
+        (Some(metadata.state), metadata.updated_at)
     } else {
-        None
+        (None, None)
     };
 
-    Ok(remote_state)
+    Ok(SynchronizationResult {
+        remote_state,
+        remote_updated_at,
+    })
 }
 
 pub async fn archive_repo(repo: &Repo) -> anyhow::Result<()> {
@@ -545,12 +580,38 @@ fn authenticated_git_command(repo: &Repo) -> tokio::process::Command {
     command
 }
 
-async fn local_remote_ref_state(repo_dir: &Path) -> anyhow::Result<String> {
+struct LocalRepoMetadata {
+    state: String,
+    updated_at: Option<i64>,
+}
+
+async fn local_remote_updated_at_if_matching(
+    repo_name: &str,
+    remote_state: &str,
+) -> anyhow::Result<Option<i64>> {
+    let repo_dir = clone_repo_path_for("ssh", repo_name);
+    let Some(metadata) = local_repo_metadata(&repo_dir).await? else {
+        return Ok(None);
+    };
+
+    if metadata.state == remote_state {
+        Ok(metadata.updated_at)
+    } else {
+        Ok(None)
+    }
+}
+
+async fn local_repo_metadata(repo_dir: &Path) -> anyhow::Result<Option<LocalRepoMetadata>> {
+    if !repo_dir.is_dir() {
+        return Ok(None);
+    }
+
     let output = tokio::process::Command::new("git")
         .arg("-C")
         .arg(repo_dir)
         .arg("for-each-ref")
-        .arg("--format=%(objectname)\t%(refname)")
+        .arg("--format=%(objectname)\t%(refname)\t%(creatordate:unix)")
+        .arg("refs")
         .output()
         .await?;
     if !output.status.success() {
@@ -560,13 +621,49 @@ async fn local_remote_ref_state(repo_dir: &Path) -> anyhow::Result<String> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    Ok(ssh::canonical_remote_ref_state(&output.stdout))
+
+    Ok(Some(parse_local_repo_metadata(&output.stdout)))
+}
+
+fn parse_local_repo_metadata(output: &[u8]) -> LocalRepoMetadata {
+    let mut state_lines = Vec::new();
+    for line in String::from_utf8_lossy(output).lines() {
+        let mut fields = line.splitn(3, '\t');
+        let Some(object_name) = fields.next() else {
+            continue;
+        };
+        let Some(ref_name) = fields.next() else {
+            continue;
+        };
+        if !object_name.is_empty() && !ref_name.is_empty() {
+            state_lines.push(format!("{object_name}\t{ref_name}"));
+        }
+    }
+    state_lines.sort();
+
+    LocalRepoMetadata {
+        state: state_lines.join("\n"),
+        updated_at: latest_ref_update_timestamp(output),
+    }
+}
+
+fn latest_ref_update_timestamp(output: &[u8]) -> Option<i64> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter_map(|line| line.rsplit_once('\t')?.1.parse::<i64>().ok())
+        .max()
+}
+
+fn clone_root_for(namespace: &str) -> PathBuf {
+    Path::new(&CONFIG.work_dir).join("clone").join(namespace)
+}
+
+fn clone_repo_path_for(namespace: &str, repo_name: &str) -> PathBuf {
+    clone_root_for(namespace).join(format!("{repo_name}.git"))
 }
 
 fn clone_dir_for(repo: &Repo) -> PathBuf {
-    Path::new(&CONFIG.work_dir)
-        .join("clone")
-        .join(repo.namespace())
+    clone_root_for(repo.namespace())
 }
 
 fn archive_dir_for(repo: &Repo) -> PathBuf {
@@ -947,12 +1044,59 @@ mod tests {
     fn ssh_backup_decision_uses_ref_state_and_legacy_archive() {
         let mut repo = test_ssh_repo("project", "ssh/");
         repo.archive_date = Some(100);
+        repo.updated_at = Some(90);
         repo.remote_state = Some("new-state".into());
         repo.archived_state = Some("new-state".into());
         assert!(!repo.needs_backup());
 
         repo.remote_state = Some("changed-state".into());
         assert!(repo.needs_backup());
+    }
+
+    #[test]
+    fn ssh_backup_decision_uses_newest_local_ref_timestamp() {
+        let mut repo = test_ssh_repo("project", "ssh/");
+        repo.archive_date = Some(100);
+        repo.remote_state = Some("same-state".into());
+        repo.archived_state = Some("same-state".into());
+
+        repo.updated_at = Some(99);
+        assert!(!repo.needs_backup());
+
+        repo.updated_at = Some(101);
+        assert!(repo.needs_backup());
+    }
+
+    #[test]
+    fn ssh_archive_is_required_for_any_ref_change() {
+        let mut repo = test_ssh_repo("project", "ssh/");
+        repo.archive_date = Some(100);
+        repo.remote_state = Some("new-state".into());
+        repo.archived_state = Some("old-state".into());
+
+        assert!(repo.should_archive_after_sync(Some(50)));
+    }
+
+    #[test]
+    fn ssh_archive_is_skipped_when_refs_and_timestamp_are_not_newer() {
+        let mut repo = test_ssh_repo("project", "ssh/");
+        repo.archive_date = Some(100);
+        repo.remote_state = Some("same-state".into());
+        repo.archived_state = Some("same-state".into());
+
+        assert!(!repo.should_archive_after_sync(Some(100)));
+        assert!(!repo.should_archive_after_sync(Some(50)));
+    }
+
+    #[test]
+    fn latest_ref_update_timestamp_includes_branches_and_tags() {
+        let refs = b"hash-main\trefs/heads/main\t100\nhash-feature\trefs/heads/feature\t250\nhash-tag\trefs/tags/v1\t300\n";
+
+        assert_eq!(latest_ref_update_timestamp(refs), Some(300));
+        assert_eq!(
+            parse_local_repo_metadata(refs).state,
+            "hash-feature\trefs/heads/feature\nhash-main\trefs/heads/main\nhash-tag\trefs/tags/v1"
+        );
     }
 
     #[test]

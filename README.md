@@ -37,6 +37,8 @@ When `SSH_DISABLE_HOST_KEY_CHECK=true`, the application accepts any SSH host key
 
 The SSH source lists only immediate directories under `SSH_ROOT_DIR`. Non-Git directories are skipped. Valid repositories are stored under `SSH_S3_PATH_PREFIX`; a small `<repository>.state` object records the synchronized Git refs so unchanged SSH repositories are not re-uploaded on later runs.
 
+For SSH repositories, the backup decision also compares the S3 archive's last-modified time with the newest Git ref creation/update time found in the local mirror. All advertised refs are considered, including every branch, tag, note, and other Git ref. Any ref-state change still triggers a backup so tag creation, tag/branch deletion, force-updates, and similar changes are preserved even when the changed ref points to an older commit; Git-over-SSH does not expose the time of a ref update itself. If the refs are unchanged and the newest Git update is not newer than the S3 archive, the archive is skipped.
+
 GitHub and SSH may be configured together. Keep their S3 prefixes separate, especially when repositories with the same name exist in both sources. Their temporary clone and archive directories are also separated locally.
 
 At least one source must be configured. A partial GitHub or SSH configuration is rejected at startup.
